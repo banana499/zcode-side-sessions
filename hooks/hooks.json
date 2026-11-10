@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "process", "command": "/bin/sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_py311.sh", "${CLAUDE_PLUGIN_ROOT}/hooks/side_sessions_hook.py"], "timeoutMs": 3000}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "process", "command": "/bin/sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_py311.sh", "${CLAUDE_PLUGIN_ROOT}/hooks/side_sessions_hook.py"], "timeoutMs": 3000}]}],
+    "PreToolUse": [{"hooks": [{"type": "process", "command": "/bin/sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_py311.sh", "${CLAUDE_PLUGIN_ROOT}/hooks/side_sessions_hook.py"], "timeoutMs": 3000}]}],
+    "PostToolUse": [{"hooks": [{"type": "process", "command": "/bin/sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_py311.sh", "${CLAUDE_PLUGIN_ROOT}/hooks/side_sessions_hook.py"], "timeoutMs": 3000}]}],
+    "Stop": [{"hooks": [{"type": "process", "command": "/bin/sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_py311.sh", "${CLAUDE_PLUGIN_ROOT}/hooks/side_sessions_hook.py"], "timeoutMs": 3000}]}]
+  }
+}

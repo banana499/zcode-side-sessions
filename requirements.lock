@@ -1,0 +1,45 @@
+# ==============================================================================
+# side-sessions Dependency & Runtime Baseline Lockfile (requirements.lock)
+# Target Plugin Version: 0.2.0
+# Target Host Baseline:  ZCode v0.17.1 (darwin / POSIX)
+# ==============================================================================
+#
+# 1. 核心运行时零外部第三方包依赖（Zero Third-Party Runtime Dependencies）
+# ------------------------------------------------------------------------------
+# 本插件（mcp_server.py / side_sessions_hook.py / engine.py / state.py /
+# contracts.py / worktree.py / driver.py / worker_runner.py / host_adapter.py /
+# test_side_sessions.py）完全基于 Python 3.11+ 标准库构建，无需安装任何 PyPI
+# 第三方包即可运行完整的低层 stdio JSON-RPC MCP 服务、同步 process Hook、
+# SQLite WAL 事务存储与守护进程调度。
+#
+# 核心标准库模块基线：
+# - sqlite3      : 统一权威状态库（WAL 模式、BEGIN IMMEDIATE、foreign_keys=ON、synchronous=FULL、backup API）
+# - fcntl        : POSIX 稳定 inode 文件锁（maintenance.lock / supervisor.lock / session-<node_id>.lock）
+# - subprocess   : Git worktree argv 调用与独立受控宿主 app-server 进程管理（禁用 shell=True）
+# - json         : 低层 MCP JSON-RPC 2.0 协议解析（完整保留 tools/call.params._meta）、Hook I/O 与规范化 JSON 序列化
+# - hashlib      : SHA-256 语义哈希（semantic_sha256）、产物分块校验（chunk_sha256）与快照摘要（snapshot_hash）
+# - pathlib / os : 安全路径解析、目录描述符逐级 openat(O_NOFOLLOW) 与 0700/0600 权限校验
+# - unittest     : 全套非宿主确定性单元测试与多进程竞争自测套件
+#
+# 2. 解释器与协议基线要求（Interpreter & Protocol Baseline）
+# ------------------------------------------------------------------------------
+# - Python 版本要求：Python >= 3.11（推荐 3.11+，支持标准库 typing / tomllib / 改进的 sqlite3 与异常处理）
+# - 平台要求：POSIX 兼容系统（macOS darwin / Linux，支持 fcntl.flock 与 os.open O_NOFOLLOW）
+# - 解释器一致性约束：
+#   .mcp.json、hooks/hooks.json 与 launchd 服务（com.zcode.side-sessions.plist）
+#   必须解析到同一个已验证的 Python 3.11+ 解释器路径。若使用专用虚拟环境，须将各入口的
+#   command 替换为该虚拟环境的规范绝对路径，不依赖用户交互式 shell 激活，且严禁在
+#   Hook 执行期间自动运行 pip install。
+# - MCP 协议与元数据要求：
+#   采用低层 stdio JSON-RPC 2.0 处理器直接读取原始请求中的 `params._meta`
+#   （优先读取 `com.zcode/request-context`，兼容平铺字段并强制冲突检测），
+#   避免高层第三方 SDK 装饰器剥离 `_meta` 导致 CALLER_UNBOUND。
+#
+# 3. 未来引入外部依赖的锁定准则（Pinning Policy）
+# ------------------------------------------------------------------------------
+# 若未来版本引入任何外部包，必须先通过 Step 7 `host-contract` 的 `params._meta`
+# 透传实测验收，并在此文件中使用 `package==version --hash=sha256:...` 锁定精确版本
+# 与 SHA-256 摘要；严禁填入未经实测的第三方包版本号。
+#
+# 当前外部第三方依赖集合（空，零外部依赖）：
+# (none)

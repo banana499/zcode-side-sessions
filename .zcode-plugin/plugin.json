@@ -1,0 +1,23 @@
+{
+  "name": "side-sessions",
+  "version": "0.2.0",
+  "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
+  "author": {
+    "name": "banana499"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/banana499/zcode-side-sessions",
+  "repository": "https://github.com/banana499/zcode-side-sessions",
+  "keywords": [
+    "side-sessions",
+    "multi-agent",
+    "session-tree",
+    "git-worktree",
+    "parallel-tasks",
+    "mcp",
+    "hooks",
+    "zcode"
+  ],
+  "skills": "./skills",
+  "commands": "./commands"
+}

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>ZCode 3.17.2 Sidebar Synthetic DOM &amp; Fiber Fixture</title>
+  <style>
+    :root {
+      --color-border: rgba(135, 136, 143, 0.25);
+      --color-foreground: #e6e7eb;
+      --color-foreground-subtlest: #87888f;
+      --color-surface-hover: rgba(255, 255, 255, 0.06);
+      --color-selected: rgba(255, 255, 255, 0.12);
+      --color-warning: #f59e0b;
+      --color-destructive: #ef4444;
+    }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #18191c;
+      color: var(--color-foreground);
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    [data-project-sidebar-panel="navigation"] {
+      width: 280px;
+      border: 1px solid var(--color-border);
+      padding: 8px;
+    }
+    ul.native-tasks {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .py-px {
+      padding: 1px 0;
+    }
+    li[data-testid^="task-item-"] {
+      list-style: none;
+      padding: 4px 8px;
+      border-radius: 6px;
+    }
+    .flex-1.h-6 {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding-left: 18px;
+    }
+    .min-w-0.flex-1.overflow-hidden {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <aside data-project-sidebar-panel="navigation">
+    <section data-project-id="proj-1" data-project-host="local">
+      <div data-testid="virtual-project-tasks" id="project-tasks-host">
+        <ul class="native-tasks" id="native-task-list"></ul>
+        <button type="button" data-task-list-show-more="true" id="show-more-btn">显示更多</button>
+      </div>
+    </section>
+  </aside>
+
+  <script>
+    (() => {
+      const FIBER_KEY = '__reactFiber$synth19';
+      const PROPS_KEY = '__reactProps$synth19';
+      const WORKSPACE = '/tmp/synth-workspace';
+
+      const ALL_TASKS = [
+        { taskId: 'sess_parent_1', title: '主架构评审会话', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+        { taskId: 'sess_child_1', title: '子会话一：数据库核查', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+        { taskId: 'sess_child_2', title: '子会话二：前端树验证', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+        { taskId: 'sess_other_1', title: '独立任务 A', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+        { taskId: 'sess_other_2', title: '独立任务 B', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+        { taskId: 'sess_other_3', title: '独立任务 C', workspacePath: WORKSPACE, hostId: 'local', archived: false },
+      ];
+
+      let activeTaskId = 'sess_parent_1';
+      let currentLimit = 5;
+      const selectCalls = [];
+
+      function onSelect(workspacePath, taskId, workspaceIdentity, remoteSessionId, unreadAt) {
+        selectCalls.push({ workspacePath, taskId, workspaceIdentity, remoteSessionId, unreadAt });
+        activeTaskId = taskId;
+        renderNativeList();
+      }
+
+      const wctFiber = {
+        tag: 0,
+        memoizedProps: { tree: { projects: ['proj-1'] } },
+        return: null,
+      };
+
+      const h2 = { memoizedState: [ALL_TASKS, []], next: null };
+      const h1 = { memoizedState: false, next: h2 };
+      const h0Queue = {
+        dispatch(nextL) {
+          currentLimit = typeof nextL === 'function' ? nextL(currentLimit) : nextL;
+          h0.memoizedState = currentLimit;
+          renderNativeList();
+        },
+      };
+      const h0 = { memoizedState: currentLimit, queue: h0Queue, next: h1 };
+
+      const trFiber = {
+        tag: 0,
+        memoizedProps: { tasks: ALL_TASKS, onSelect, kind: 'project' },
+        memoizedState: h0,
+        return: wctFiber,
+        child: null,
+        sibling: null,
+        alternate: null,
+      };
+
+      function renderNativeList() {
+        h0.memoizedState = currentLimit;
+        const ul = document.getElementById('native-task-list');
+        ul.replaceChildren();
+        const visibleTasks = ALL_TASKS.slice(0, currentLimit);
+        const hostDiv = document.getElementById('project-tasks-host');
+        const trHostFiber = {
+          tag: 5,
+          stateNode: hostDiv,
+          memoizedProps: {},
+          return: trFiber,
+          child: null,
+          sibling: null,
+        };
+        trFiber.child = trHostFiber;
+
+        let prevOct = null;
+        for (const t of visibleTasks) {
+          const wrapper = document.createElement('div');
+          wrapper.className = 'py-px';
+          const li = document.createElement('li');
+          li.setAttribute('data-testid', `task-item-${t.taskId}`);
+          li.draggable = true;
+          const slot = document.createElement('div');
+          slot.className = 'relative min-w-0 flex h-6 flex-1 flex-wrap items-center gap-1.5';
+          const fl = document.createElement('div');
+          fl.className = 'min-w-0 flex-1 overflow-hidden whitespace-nowrap';
+          const titleSpan = document.createElement('span');
+          titleSpan.setAttribute('data-task-title-copy', 'original');
+          titleSpan.textContent = t.title;
+          fl.appendChild(titleSpan);
+          slot.appendChild(fl);
+          li.appendChild(slot);
+          wrapper.appendChild(li);
+          ul.appendChild(wrapper);
+
+          const octProps = { task: t, onSelect, variant: 'project' };
+          const wctItemFiber = {
+            tag: 0,
+            memoizedProps: { activeTaskId, isWorkspaceActive: true },
+            return: null,
+            child: null,
+            sibling: null,
+          };
+          const wrapperFiber = {
+            tag: 5,
+            stateNode: wrapper,
+            memoizedProps: { className: 'py-px' },
+            return: null,
+            child: wctItemFiber,
+            sibling: null,
+          };
+          wctItemFiber.return = wrapperFiber;
+          const octFiber = {
+            tag: 0,
+            memoizedProps: octProps,
+            return: trFiber,
+            child: wrapperFiber,
+            sibling: null,
+          };
+          wrapperFiber.return = octFiber;
+
+          const staleProps = { task: { taskId: 'stale' } };
+          const currentLiProps = { 'data-testid': `task-item-${t.taskId}` };
+          const liveLiFiber = {
+            tag: 5,
+            stateNode: li,
+            memoizedProps: currentLiProps,
+            return: wctItemFiber,
+            child: null,
+            sibling: null,
+          };
+          const staleLiFiber = {
+            tag: 5,
+            stateNode: li,
+            memoizedProps: staleProps,
+            return: null,
+            alternate: liveLiFiber,
+          };
+          liveLiFiber.alternate = staleLiFiber;
+          li[FIBER_KEY] = staleLiFiber;
+          li[PROPS_KEY] = currentLiProps;
+
+          if (!trHostFiber.child) trHostFiber.child = octFiber;
+          else prevOct.sibling = octFiber;
+          prevOct = octFiber;
+        }
+      }
+
+      document.getElementById('show-more-btn').addEventListener('click', () => {
+        h0Queue.dispatch(l => l + 5);
+      });
+
+      renderNativeList();
+      window.__SYNTH_FIXTURE__ = {
+        getActiveTaskId: () => activeTaskId,
+        getLimit: () => currentLimit,
+        getSelectCalls: () => selectCalls,
+        renderNativeList,
+      };
+    })();
+  </script>
+</body>
+</html>

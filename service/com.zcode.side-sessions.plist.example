@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.zcode.side-sessions.plist.example
+  macOS launchd 用户级守护服务示例模板（统一由 side_sessions_agent.py 托管两个子进程：
+  1) worker_runner.py serve 后台会话调度器
+  2) zcode_sidebar_injector.py serve 原位侧边栏父子会话树 CDP 注入器）
+
+  ============================================================================
+  1. 占位符与环境说明（由 sidebar_ui_ctl.py install 通过 plistlib 生成，严禁使用 ~ 或相对路径）
+  ============================================================================
+  - __PYTHON3_PATH__ : 已验证的 Python 3.11+ 解释器绝对路径（动态探测，严禁使用 < 3.11 的系统解释器）
+  - __STATE_ROOT__   : side-sessions 状态根目录展开绝对路径（默认 $HOME/.zcode/side-sessions，权限应为 0700）
+  - __ZCODE_BIN__    : zcode CLI 可执行文件展开绝对路径（例如 $HOME/.local/bin/zcode）
+  - __NODE_BIN_DIR__ : Node.js 可执行文件所在 bin 目录绝对路径（由 sidebar_ui_ctl.py 动态解析）
+
+  ============================================================================
+  2. 安装、状态检查与卸载步骤（推荐通过 sidebar_ui_ctl.py 执行）
+  ============================================================================
+  步骤 A：一键安装并启动 LaunchAgent
+    "__PYTHON3_PATH__" "__PLUGIN_ROOT__/scripts/sidebar_ui_ctl.py" install (指定 state-home 为 "__STATE_ROOT__")
+
+  步骤 B：查看运行状态与健康检查
+    "__PYTHON3_PATH__" "__PLUGIN_ROOT__/scripts/sidebar_ui_ctl.py" doctor (指定 state-home 为 "__STATE_ROOT__")
+    launchctl print "gui/$(id -u)/com.zcode.side-sessions"
+
+  步骤 C：一键卸载与无损还原
+    "__PYTHON3_PATH__" "__PLUGIN_ROOT__/scripts/sidebar_ui_ctl.py" uninstall (指定 state-home 为 "__STATE_ROOT__" 并保留数据)
+
+  ============================================================================
+  3. 架构安全边界说明
+  ============================================================================
+  - 单一 com.zcode.side-sessions LaunchAgent 入口为 __STATE_ROOT__/sidebar-ui/launcher/side_sessions_agent.py，
+    在内部独立拉起并监管 worker_runner.py 与 zcode_sidebar_injector.py 两个子进程，各自退避、各自加锁，UI 异常绝不影响 worker。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.zcode.side-sessions</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON3_PATH__</string><string>-B</string>
+    <string>__STATE_ROOT__/sidebar-ui/launcher/side_sessions_agent.py</string>
+    <string>serve</string>
+    <string>--state-home</string><string>__STATE_ROOT__</string>
+  </array>
+  <key>WorkingDirectory</key><string>__STATE_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ZCODE_SIDE_SESSIONS_HOME</key><string>__STATE_ROOT__</string>
+    <key>ZCODE_SIDE_SESSIONS_ZCODE_BIN</key><string>__ZCODE_BIN__</string>
+    <key>ZCODE_SIDE_SESSIONS_PYTHON3</key><string>__PYTHON3_PATH__</string>
+    <key>PATH</key><string>__NODE_BIN_DIR__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__STATE_ROOT__/logs/agent.stdout.log</string>
+  <key>StandardErrorPath</key><string>__STATE_ROOT__/logs/agent.stderr.log</string>
+</dict>
+</plist>
