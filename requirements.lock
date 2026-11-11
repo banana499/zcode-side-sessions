@@ -1,7 +1,7 @@
 # ==============================================================================
 # side-sessions Dependency & Runtime Baseline Lockfile (requirements.lock)
-# Target Plugin Version: 0.2.0
-# Target Host Baseline:  ZCode v0.17.1 (darwin / POSIX)
+# Target Plugin Version: 0.2.1
+# Target Host Baseline:  ZCode 3.17.2 (darwin / POSIX)
 # ==============================================================================
 #
 # 1. 核心运行时零外部第三方包依赖（Zero Third-Party Runtime Dependencies）

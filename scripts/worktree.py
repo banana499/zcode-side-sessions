@@ -836,11 +836,19 @@ def prepare(
         _run_git(snap.repo_root, ["worktree", "remove", "--force", str(target_wt_path)], isolated=True)
         _run_git(snap.repo_root, ["branch", "-d", branch_name], isolated=True)
 
-    add_proc = _run_git(
-        snap.repo_root,
-        ["worktree", "add", "-b", branch_name, str(target_wt_path), base_commit],
-        isolated=True,
-    )
+    try:
+        add_proc = _run_git(
+            snap.repo_root,
+            ["worktree", "add", "-b", branch_name, str(target_wt_path), base_commit],
+            timeout_sec=300.0,
+            isolated=True,
+        )
+    except SideSessionError:
+        try:
+            _rollback_new_worktree()
+        except SideSessionError:
+            pass
+        raise
     if add_proc.returncode != 0:
         raise SideSessionError(
             ErrorCode.WORKSPACE_MISMATCH,
@@ -1521,7 +1529,7 @@ def cleanup_owned(
         )
 
     repo_root = record.repo_root or str(wt_path)
-    rm_proc = _run_git(repo_root, ["worktree", "remove", str(wt_path)], isolated=True)
+    rm_proc = _run_git(repo_root, ["worktree", "remove", str(wt_path)], timeout_sec=120.0, isolated=True)
     if rm_proc.returncode != 0:
         return CleanupResult(
             cleaned=False,

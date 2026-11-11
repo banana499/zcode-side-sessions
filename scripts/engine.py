@@ -570,6 +570,8 @@ class Engine:
             return dict(row)
         if ref.startswith("task_"):
             hex_prefix = ref[len("task_") :].lower()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", hex_prefix):
+                return None
             rows = conn.execute("SELECT * FROM proposals ORDER BY created_at DESC").fetchall()
             for r in rows:
                 pid_clean = str(r["proposal_id"]).replace("-", "").lower()
@@ -6010,7 +6012,10 @@ class Engine:
                 except SideSessionError as drv_exc:
                     raise _fail_job(drv_exc.code, drv_exc.message, drv_exc.details) from drv_exc
 
-                calc = self._compute_worktree_diff_and_preview(wt_record)
+                try:
+                    calc = self._compute_worktree_diff_and_preview(wt_record)
+                except SideSessionError as calc_exc:
+                    raise _fail_job(calc_exc.code, calc_exc.message, calc_exc.details) from calc_exc
                 post_chk = calc["post_chk"]
                 parent_info = calc["parent_info"]
 
@@ -6082,11 +6087,14 @@ class Engine:
                     )
 
                 # Step 4: Conflict precheck via `git merge-tree --write-tree --name-only -z`
-                mt_proc = _worktree_mod._run_git(
-                    wt_record.repo_root,
-                    ["merge-tree", "--write-tree", "--name-only", "-z", parent_head, child_tip],
-                    isolated=True,
-                )
+                try:
+                    mt_proc = _worktree_mod._run_git(
+                        wt_record.repo_root,
+                        ["merge-tree", "--write-tree", "--name-only", "-z", parent_head, child_tip],
+                        isolated=True,
+                    )
+                except SideSessionError as mt_exc:
+                    raise _fail_job(mt_exc.code, mt_exc.message, mt_exc.details) from mt_exc
                 if mt_proc.returncode not in (0, 1):
                     raise _fail_job(
                         ErrorCode.CAPABILITY_UNAVAILABLE,
@@ -7850,6 +7858,7 @@ class Engine:
                         transfer_id,
                     ),
                 )
+                txn.execute("UPDATE task_turn_bindings SET state = 'released' WHERE task_id = ? AND state = 'frozen'", (task_id,))
                 txn.execute(
                     """
                     UPDATE operations
@@ -7980,7 +7989,7 @@ class Engine:
             transfer_committed = transfer_row is not None and str(transfer_row["state"]) == "committed"
             guard_state = getattr(guard_receipt, "state", None) if guard_receipt is not None else None
 
-            if guard_state in ("requested", "unknown"):
+            if guard_state == "unknown":
                 with self.store.transaction("IMMEDIATE") as rec_txn:
                     rec_txn.execute(
                         "UPDATE transfers SET state = 'reconciliation', updated_at = ? WHERE transfer_id = ?",
@@ -8009,7 +8018,7 @@ class Engine:
                 raise
 
             resume_ok = False
-            if guard_receipt is not None and guard_state == "prepared":
+            if guard_receipt is not None and guard_state in ("prepared", "requested"):
                 resume_rcpt = self._adapter_resume_task_guard(
                     guard_id=guard_receipt.guard_id,
                     expected_task_revision=expected_rev,
@@ -8118,6 +8127,7 @@ class Engine:
                 """,
                 (f"brief-accepted:{node_id}:{tr_row['brief_id']}", now, transfer_id),
             )
+            txn.execute("UPDATE task_turn_bindings SET state = 'released' WHERE task_id = ? AND state = 'frozen'", (task_id,))
             if tr_row["operation_id"]:
                 txn.execute(
                     "UPDATE operations SET result_state = 'committed', revision = revision + 1, updated_at = ? WHERE operation_id = ?",
@@ -10815,6 +10825,8 @@ class Engine:
                     for k in allowed_ev_keys:
                         if k in evidence_arg and evidence_arg[k] is not None:
                             cred_fields[k] = evidence_arg[k]
+                for tk in ("interaction_token", "approval_token", "human_signature", "signature", "trusted_token"):
+                    cred_fields.pop(tk, None)
 
                 has_explicit_inp = bool(
                     cred_fields.get("real_input_id")
@@ -11558,7 +11570,7 @@ class Engine:
             child_name = str(payload.get("child_name") or ev.get("child_node_id") or "group")
             child_id = str(ev.get("child_node_id") or "")
             outcome = str(payload.get("outcome") or "")
-            recap = str(payload.get("recap") or "")
+            recap = html.escape(str(payload.get("recap") or ""), quote=False)
             report_ref = str(payload.get("report_ref") or "")
             manifest_ref = str(payload.get("manifest_ref") or "")
             ref_part = f" report_ref={report_ref}" if report_ref else (f" manifest_ref={manifest_ref}" if manifest_ref else "")
@@ -11988,6 +12000,7 @@ class Engine:
                                 origin="slash_command",
                                 runtime_turn_id=ctx.runtime_turn_id,
                                 command_id="/side-sessions:dismiss",
+                                action_binding={"purpose": "dismiss", "target_id": prop_ref},
                             )
                             res_dis = self.reject_proposal(caller_ctx, {"proposal_id": prop_ref})
                             command_feedback = (

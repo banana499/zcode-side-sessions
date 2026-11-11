@@ -4,7 +4,7 @@
 **Claude Desktop-Style Multi-Session Tree, Isolated Git Worktree Parallel Subtasks, and Collapsible Sidebar Tree Plugin for ZCode**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](./.zcode-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.1-green.svg)](./.zcode-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.11-3776AB.svg)](./requirements.lock)
 [![Git](https://img.shields.io/badge/Git-%3E%3D2.40-F05032.svg)](#环境要求--requirements)
 
@@ -43,7 +43,7 @@
 | 组件 | 要求说明 |
 | :--- | :--- |
 | **宿主环境** | ZCode Desktop 或 ZCode CLI |
-| **Python** | `Python >= 3.11`（零第三方包依赖；插件内置 `scripts/run_py311.sh` 自动按序探测 Homebrew、pyenv、Framework 及系统 Python 3.11+） |
+| **Python** | `Python >= 3.11`（零第三方包依赖；插件内置 `scripts/run_py311.sh` 自动按序探测 Homebrew、pyenv、Framework 及系统 Python 3.11+；也可用环境变量 ZCODE_SIDE_SESSIONS_PYTHON 指定解释器绝对路径） |
 | **Git** | `git >= 2.40`（`write_code` 分支隔离与 `git merge-tree --write-tree` 零污染合并所需） |
 | **平台支持矩阵** | **核心 35 个 MCP 工具 + 5 个同步生命周期 Hooks + 11 个斜杠命令**：完整支持 **macOS 与 Linux**（POSIX）；<br>**左侧边栏原位 DOM 会话树 UI 注入**：当前适配 **macOS ZCode Desktop 3.17.2**（UI 注入可选启用，不影响核心多会话与后台 Worker 运行）。 |
 
@@ -57,27 +57,30 @@
    ```text
    https://github.com/banana499/zcode-side-sessions
    ```
-4. 切换到 **个人（Personal） -> `side-sessions-marketplace`**，找到 **多会话树与并行子任务 (Side Sessions)**（版本 `0.2.0`），点击 **安装（Install）** 并保持启用状态。
+4. 切换到 **个人（Personal） -> `side-sessions-marketplace`**，找到 **多会话树与并行子任务 (Side Sessions)**（版本 `0.2.1`），点击 **安装（Install）** 并保持启用状态。
 5. 新建一个对话任务即可直接使用 `/side-sessions:tree` 等全部斜杠命令、协调技能与 35 个 MCP 工具。
 
-> **插件升级方式**：在插件市场右上角齿轮打开 **市场源（Marketplace Sources）**，刷新 `side-sessions-marketplace`，返回 **个人（Personal）** 点击 `side-sessions` 的 **更新（Update）** 即可。
+> **插件升级方式**：在插件市场右上角齿轮打开 **市场源（Marketplace Sources）**，刷新 `side-sessions-marketplace`，返回 **个人（Personal）** 点击 `side-sessions` 的 **更新（Update）** 即可。若已启用第 5 节的侧边栏 / LaunchAgent，升级后必须用新版本目录重新执行一次 sidebar_ui_ctl.py install，否则常驻 Worker 与侧边栏注入器仍运行旧版本快照；下文 PLUGIN_DIR 中的版本号目录随升级变化。
 
 ### 5. macOS 左侧边栏树 UI 启用、状态检查与无损卸载
 
-> **兼容性说明**：核心 35 个 MCP 工具与同步 Hooks 安装插件后即刻在 macOS / Linux 跨平台生效；以下 `sidebar_ui_ctl.py` 命令仅用于在 **macOS ZCode Desktop 3.17.2** 上启用原位左侧边栏可折叠会话树与常驻 `LaunchAgent` 守护。
+> **兼容性说明**：核心 35 个 MCP 工具与同步 Hooks 安装插件后即刻在 macOS / Linux 跨平台生效；以下 `sidebar_ui_ctl.py` 命令仅用于在 **macOS ZCode Desktop 3.17.2** 上启用原位左侧边栏可折叠会话树与常驻 `LaunchAgent` 守护。侧边栏功能要求 ZCode.app 安装在 /Applications 目录。
 
-插件通过市场安装后，脚本位于 `~/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.0/scripts/sidebar_ui_ctl.py`：
+插件通过市场安装后，脚本位于 `~/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.1/scripts/sidebar_ui_ctl.py`：
 
 ```bash
 # 定义脚本路径变量（使用插件内置 run_py311.sh 自动寻路 Python >= 3.11）
-PLUGIN_DIR="$HOME/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.0"
+PLUGIN_DIR="$HOME/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.1"
 
 # 1. 安装常驻 LaunchAgent 与侧边栏发布快照
 # 方式 A（免修改应用包）：配合带调试端口启动的 ZCode 使用
+# 注意：执行 start-zcode 前需先完全退出 ZCode（Cmd+Q）；ZCode 仍在运行且未带调试端口时该命令返回 WAITING_FOR_DEBUG_LAUNCH，不会生效
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" install
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" start-zcode
 
 # 方式 B（支持 Dock 直接启动 ZCode 3.17.2）：启用可逆 ASAR 调试端口补丁（自动备份原始摘要与字节）
+# 安全提示：该补丁会修改 app.asar，使 ZCode.app 的 codesign 校验失败，并让 ZCode 每次启动都开启仅回环的远程调试端口，
+# 本机其他进程可借此控制 ZCode；执行 uninstall 可字节级还原。不接受此风险请使用方式 A。
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" install --cdp-patch
 
 # 2. 检查守护进程与侧边栏注入实时状态（确认 injector.state == "READY"）
@@ -159,11 +162,11 @@ Built entirely on the **Python 3.11+ standard library (zero third-party runtime 
 ### 3. Requirements & Platform Matrix
 
 - **Host**: ZCode Desktop or ZCode CLI
-- **Python**: `Python >= 3.11` (zero third-party PyPI packages; built-in `scripts/run_py311.sh` automatically locates Homebrew, pyenv, framework, or system Python 3.11+)
+- **Python**: `Python >= 3.11` (zero third-party PyPI packages; built-in `scripts/run_py311.sh` automatically locates Homebrew, pyenv, framework, or system Python 3.11+; set ZCODE_SIDE_SESSIONS_PYTHON to an absolute interpreter path to override)
 - **Git**: `git >= 2.40` (required for `git merge-tree --write-tree`)
 - **Platform Support**:
   - **Core 35 MCP Tools + 5 Synchronous Hooks + 11 Slash Commands**: Cross-platform **macOS and Linux** (POSIX).
-  - **In-Place Left Sidebar DOM Tree UI**: Currently tailored for **macOS ZCode Desktop 3.17.2** (optional enhancement; core session orchestration works without UI injection).
+  - **In-Place Left Sidebar DOM Tree UI**: Currently tailored for **macOS ZCode Desktop 3.17.2** (optional enhancement; core session orchestration works without UI injection). The sidebar feature requires ZCode.app to be installed in /Applications.
 
 ### 4. Installation (ZCode Plugin Marketplace)
 
@@ -173,21 +176,26 @@ Built entirely on the **Python 3.11+ standard library (zero third-party runtime 
    ```text
    https://github.com/banana499/zcode-side-sessions
    ```
-4. Open **Personal -> `side-sessions-marketplace`**, select **Side Sessions** (`v0.2.0`), and click **Install**.
+4. Open **Personal -> `side-sessions-marketplace`**, select **Side Sessions** (`v0.2.1`), and click **Install**.
 5. Start a new conversation task to access all `/side-sessions:*` slash commands, skills, and MCP tools.
 
 ### 5. macOS Sidebar Tree UI Setup, Status & Lossless Uninstall
 
 After installing via the marketplace, manage the optional macOS sidebar UI and LaunchAgent using `sidebar_ui_ctl.py`:
 
+> **Upgrading**: after updating the plugin in the marketplace, re-run sidebar_ui_ctl.py install from the new version directory if you enabled the sidebar / LaunchAgent; otherwise the daemon keeps running the previously staged snapshot. The version segment in PLUGIN_DIR changes with each release.
+
 ```bash
-PLUGIN_DIR="$HOME/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.0"
+PLUGIN_DIR="$HOME/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessions/0.2.1"
 
 # Install LaunchAgent & stage sidebar UI snapshot (Option A: launch ZCode with debug port, zero app bundle edits)
+# Note: fully quit ZCode (Cmd+Q) before start-zcode; if ZCode is already running without a debug port it returns WAITING_FOR_DEBUG_LAUNCH and does nothing
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" install
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" start-zcode
 
 # Option B (macOS ZCode 3.17.2 Dock launch): opt-in reversible ASAR debug-port patch with SHA-verified backup
+# Security note: this patch modifies app.asar, so codesign verification of ZCode.app fails and every launch opens a loopback-only
+# remote debugging port that other local processes can use to control ZCode; uninstall restores the original bytes. Use Option A if this is unacceptable.
 /bin/sh "$PLUGIN_DIR/scripts/run_py311.sh" "$PLUGIN_DIR/scripts/sidebar_ui_ctl.py" install --cdp-patch
 
 # Verify daemon & sidebar injector health (expect injector.state == "READY")
@@ -216,7 +224,7 @@ PLUGIN_DIR="$HOME/.zcode/cli/plugins/cache/side-sessions-marketplace/side-sessio
 ### 7. Verification Suite
 
 ```bash
-# 1. Run full deterministic Python unit test suite (71 tests)
+# 1. Run full deterministic Python unit test suite (80 tests)
 /bin/sh ./scripts/run_py311.sh -m unittest discover -s ./tests -v
 
 # 2. Run sidebar DOM fixpoint deduplication tests

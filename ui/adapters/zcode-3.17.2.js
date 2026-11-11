@@ -435,6 +435,7 @@
   const syncStateBySid = new Map(); // sessionId -> { attempts, nextAt, timerId }
   const titleSyncedSids = new Set();
   let latestNodesBySid = new Map();
+  let latestSnap = null;
 
   function clearSyncTimers() {
     for (const st of syncStateBySid.values()) {
@@ -459,6 +460,7 @@
 
   async function syncUnindexedNodes(snap) {
     if (!snap || !Array.isArray(snap.nodes)) return { synced: 0 };
+    latestSnap = snap;
     latestNodesBySid = new Map();
     for (const n of snap.nodes) {
       if (!n) continue;
@@ -539,7 +541,7 @@
       if (st.attempts < 5 && !st.timerId && typeof setTimeout === 'function') {
         st.timerId = setTimeout(() => {
           st.timerId = 0;
-          syncUnindexedNodes(snap).catch(() => {});
+          syncUnindexedNodes(latestSnap).catch(() => {});
         }, delayMs);
       }
     }

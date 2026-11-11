@@ -1407,8 +1407,6 @@ class HostAdapter:
             if _record_in_memory:
                 self._consumed_approval_tokens[token_key] = (purpose, target_key, evidence)
             self._issued_approvals[approval_id] = evidence
-            self._issued_tokens.add(self._trusted_token)
-            self._issued_tokens.add(approval_id)
             return evidence
 
     def verify_and_consume_approval_in_txn(
@@ -1900,7 +1898,7 @@ class HostAdapter:
             action_id = str(tool_event.get("action_id") or uuid.uuid4())
             ended_at = now if requested_state in ("completed", "failed") else None
 
-            if conn is not None:
+            if conn is not None and bare_tool != "hand_off_to_session":
                 def _write_action() -> None:
                     conn.execute(
                         """
@@ -1949,8 +1947,9 @@ class HostAdapter:
                 started_at=now,
                 ended_at=ended_at,
             )
-            with self._lock:
-                self._in_memory_actions[action_id] = bound_action
+            if bare_tool != "hand_off_to_session":
+                with self._lock:
+                    self._in_memory_actions[action_id] = bound_action
             return bound_action
         finally:
             if should_close and store_obj is not None:

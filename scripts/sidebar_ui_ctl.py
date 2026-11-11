@@ -542,7 +542,7 @@ def build_launchd_plist_dict(
         "EnvironmentVariables": {
             "ZCODE_SIDE_SESSIONS_HOME": s_root,
             "ZCODE_SIDE_SESSIONS_ZCODE_BIN": zbin,
-            "PATH": f"{ndir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": f"{ndir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONUNBUFFERED": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         },
@@ -1115,7 +1115,7 @@ def uninstall(
             "EnvironmentVariables": {
                 "ZCODE_SIDE_SESSIONS_HOME": str(root),
                 "ZCODE_SIDE_SESSIONS_ZCODE_BIN": zbin,
-                "PATH": f"{ndir}:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH": f"{ndir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
