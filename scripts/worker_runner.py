@@ -272,6 +272,7 @@ class WorkerRunner:
         self.poll_interval_ms = max(10, int(poll_interval_ms))
         self.wait_poll_timeout_ms = max(0, int(wait_poll_timeout_ms))
         self.on_wait: Callable[..., Any] | None = None
+        self._wait_tool_calls: dict[str, tuple[str | None, str | None]] = {}
 
     def close(self) -> None:
         if self._owns_store and self.store is not None:
@@ -915,9 +916,36 @@ class WorkerRunner:
         nonce = str(w_req.get("nonce") or f"nonce-{uuid.uuid4().hex[:12]}")
         question = str(w_req.get("question") or "Waiting for input")
         options = list(w_req.get("options") or [])
+        if not options and kind == "elicitation":
+            if w_req.get("requestedSchema") is not None or w_req.get("subtype") == "mcp_elicitation":
+                options = [{
+                    "kind": "schema",
+                    "subtype": "mcp_elicitation",
+                    "requestedSchema": w_req.get("requestedSchema"),
+                    "questions": list(w_req.get("questions") or []),
+                }]
+            elif w_req.get("questions"):
+                for q in w_req["questions"]:
+                    if isinstance(q, Mapping):
+                        options.append({
+                            "kind": "question",
+                            "subtype": str(w_req.get("subtype") or "ask_user_question"),
+                            "question": q.get("question", ""),
+                            "header": q.get("header", ""),
+                            "multiSelect": bool(q.get("multiSelect", False)),
+                            "options": list(q.get("options") or []),
+                        })
         req_auth = "human" if kind == "permission" or w_req.get("required_authority") == "human" else "parent_agent_allowed"
         deadline_at = w_req.get("deadline_at")
         wait_id = str(w_req.get("wait_id") or uuid.uuid4())
+        tool_call_id = str(
+            w_req.get("tool_call_id")
+            or w_req.get("toolCallId")
+            or ev.payload.get("tool_call_id")
+            or ev.payload.get("toolCallId")
+            or ""
+        ).strip() or None
+        turn_id = str(ev.runtime_turn_id or w_req.get("turn_id") or ev.payload.get("turn_id") or "").strip() or None
 
         with self.store.transaction("IMMEDIATE") as txn:
             now = utc_now_iso()
@@ -940,7 +968,7 @@ class WorkerRunner:
                         wait_id,
                         assignment.node_id,
                         assignment.run_id,
-                        ev.runtime_turn_id,
+                        turn_id,
                         handle.runtime_instance_id,
                         assignment.owner_epoch,
                         host_req_id,
@@ -967,7 +995,183 @@ class WorkerRunner:
                     "UPDATE dispatch_group_members SET state = 'waiting_input', updated_at = ? WHERE member_id = ?",
                     (now, assignment.member_id),
                 )
+        self._wait_tool_calls[wait_id] = (turn_id, tool_call_id)
         return wait_id
+
+    def _resolve_wait_from_event(
+        self,
+        assignment: RunAssignment,
+        handle: RuntimeHandle,
+        ev: RuntimeEvent,
+    ) -> bool:
+        """Converge `wait_requests` and `control_commands` upon real host `wait_resolved` event.
+
+        Returns True iff the run is still live and all waits for `assignment.run_id` are now terminal.
+        """
+        payload = ev.payload if isinstance(ev.payload, Mapping) else {}
+        req_id = str(payload.get("request_id") or payload.get("requestId") or "").strip() or None
+        tool_call_id = str(payload.get("tool_call_id") or payload.get("toolCallId") or "").strip() or None
+        turn_id = str(payload.get("turn_id") or payload.get("turnId") or ev.runtime_turn_id or "").strip() or None
+        event_ref = str(payload.get("event_id") or ev.event_id or uuid.uuid4())
+        resolution = payload.get("resolution") if isinstance(payload.get("resolution"), Mapping) else {}
+
+        with self.store.transaction("IMMEDIATE") as txn:
+            t_row = txn.execute(
+                "SELECT execution_state FROM turns WHERE run_id = ?",
+                (assignment.run_id,),
+            ).fetchone()
+            if t_row is None or str(t_row["execution_state"]) in (
+                "exited",
+                "failed",
+                "cancelled",
+                "stopping",
+                "reconciliation",
+            ):
+                return False
+
+            if req_id:
+                cands = txn.execute(
+                    """
+                    SELECT * FROM wait_requests
+                    WHERE run_id = ? AND runtime_instance_id = ? AND host_request_id = ?
+                      AND state IN ('open', 'responding', 'unknown')
+                    """,
+                    (assignment.run_id, handle.runtime_instance_id, req_id),
+                ).fetchall()
+            else:
+                if not tool_call_id:
+                    return False
+                active_rows = txn.execute(
+                    """
+                    SELECT * FROM wait_requests
+                    WHERE run_id = ? AND runtime_instance_id = ?
+                      AND state IN ('open', 'responding', 'unknown')
+                    """,
+                    (assignment.run_id, handle.runtime_instance_id),
+                ).fetchall()
+                conns = getattr(self.driver, "_connections", {})
+                conn_obj = conns.get(handle.runtime_instance_id) if isinstance(conns, Mapping) else None
+                pending_map = getattr(conn_obj, "pending_waits", {}) if conn_obj is not None else {}
+
+                matched_rows: list[Any] = []
+                for wr in active_rows:
+                    wid = str(wr["wait_id"])
+                    w_tid, w_tc = self._wait_tool_calls.get(wid, (wr["runtime_turn_id"], None))
+                    if w_tc is None and isinstance(pending_map, Mapping):
+                        p_entry = pending_map.get(str(wr["host_request_id"]))
+                        if isinstance(p_entry, Mapping):
+                            w_tc = p_entry.get("toolCallId")
+                            if w_tid is None:
+                                w_tid = p_entry.get("turnId")
+                    if w_tc != tool_call_id:
+                        continue
+                    if turn_id is not None and w_tid is not None and str(w_tid) != str(turn_id):
+                        continue
+                    matched_rows.append(wr)
+                if len(matched_rows) != 1:
+                    return False
+                cands = matched_rows
+
+            if len(cands) != 1:
+                return False
+
+            w_fresh = cands[0]
+            wait_id = str(w_fresh["wait_id"])
+            now = utc_now_iso()
+
+            txn.execute(
+                """
+                UPDATE wait_requests
+                SET state = 'resolved', receipt_ref = ?, updated_at = ?
+                WHERE wait_id = ? AND state IN ('open', 'responding', 'unknown')
+                """,
+                (event_ref, now, wait_id),
+            )
+
+            sent_cmds = txn.execute(
+                """
+                SELECT * FROM control_commands
+                WHERE wait_id = ? AND kind = 'respond_wait' AND state = 'unknown'
+                ORDER BY created_at DESC
+                """,
+                (wait_id,),
+            ).fetchall()
+            for sc in sent_cmds:
+                try:
+                    sc_payload = json.loads(sc["payload"] or "{}")
+                except Exception:
+                    sc_payload = {}
+                resp_dict = sc_payload.get("response") if isinstance(sc_payload, Mapping) else {}
+                if not isinstance(resp_dict, Mapping):
+                    resp_dict = {}
+
+                consistent = True
+                if str(w_fresh["kind"]) == "permission" and resolution.get("decision") is not None:
+                    sent_dec = str(resp_dict.get("decision") or "").strip()
+                    obs_dec = str(resolution.get("decision") or "").strip()
+                    if sent_dec and obs_dec and sent_dec != obs_dec:
+                        consistent = False
+                elif str(w_fresh["kind"]) == "elicitation":
+                    sent_act = str(resp_dict.get("action") or "").strip()
+                    obs_cancelled = resolution.get("cancelled")
+                    obs_dec = str(resolution.get("decision") or "").strip()
+                    if obs_cancelled is True and sent_act == "accept":
+                        consistent = False
+                    elif obs_dec == "deny" and sent_act == "accept":
+                        consistent = False
+
+                if consistent:
+                    txn.execute(
+                        """
+                        UPDATE control_commands
+                        SET state = 'applied', receipt_ref = ?, updated_at = ?
+                        WHERE control_id = ? AND state = 'unknown'
+                        """,
+                        (event_ref, now, sc["control_id"]),
+                    )
+                else:
+                    txn.execute(
+                        """
+                        UPDATE control_commands
+                        SET state = 'rejected', receipt_ref = ?, updated_at = ?
+                        WHERE control_id = ? AND state = 'unknown'
+                        """,
+                        (f"outcome_conflict:{event_ref}", now, sc["control_id"]),
+                    )
+
+            # Any unsent local control command must be rejected when resolved externally
+            txn.execute(
+                """
+                UPDATE control_commands
+                SET state = 'rejected', receipt_ref = 'resolved_externally', updated_at = ?
+                WHERE wait_id = ? AND kind = 'respond_wait' AND state IN ('queued', 'claimed')
+                """,
+                (now, wait_id),
+            )
+
+            rem = txn.execute(
+                """
+                SELECT COUNT(*) FROM wait_requests
+                WHERE run_id = ? AND state IN ('open', 'responding', 'unknown')
+                """,
+                (assignment.run_id,),
+            ).fetchone()[0]
+            if int(rem) == 0:
+                txn.execute(
+                    "UPDATE turns SET execution_state = 'running' WHERE run_id = ? AND execution_state = 'waiting_input'",
+                    (assignment.run_id,),
+                )
+                txn.execute(
+                    "UPDATE parent_slots SET state = 'running', updated_at = ? WHERE node_id = ? AND state = 'waiting_input'",
+                    (now, assignment.node_id),
+                )
+                if assignment.member_id:
+                    txn.execute(
+                        "UPDATE dispatch_group_members SET state = 'running', updated_at = ? WHERE member_id = ? AND state = 'waiting_input'",
+                        (now, assignment.member_id),
+                    )
+                return True
+            return False
 
     def _poll_and_apply_control_commands(
         self,
@@ -1137,24 +1341,29 @@ class WorkerRunner:
                         (ctrl_rcpt.status, ctrl_rcpt.host_receipt_id, now, control_id),
                     )
                     txn.execute(
-                        "UPDATE wait_requests SET state = ?, receipt_ref = ?, updated_at = ? WHERE wait_id = ?",
+                        "UPDATE wait_requests SET state = ?, receipt_ref = COALESCE(?, receipt_ref), updated_at = ? WHERE wait_id = ?",
                         ("resolved" if applied else "unknown", ctrl_rcpt.host_receipt_id, now, wait_id),
                     )
                     if applied:
-                        txn.execute(
-                            "UPDATE turns SET execution_state = 'running' WHERE run_id = ?",
+                        rem = txn.execute(
+                            "SELECT COUNT(*) FROM wait_requests WHERE run_id = ? AND state IN ('open', 'responding', 'unknown')",
                             (assignment.run_id,),
-                        )
-                        txn.execute(
-                            "UPDATE parent_slots SET state = 'running', updated_at = ? WHERE node_id = ? AND state != 'released'",
-                            (now, assignment.node_id),
-                        )
-                        if assignment.member_id:
+                        ).fetchone()[0]
+                        if int(rem) == 0:
                             txn.execute(
-                                "UPDATE dispatch_group_members SET state = 'running', updated_at = ? WHERE member_id = ?",
-                                (now, assignment.member_id),
+                                "UPDATE turns SET execution_state = 'running' WHERE run_id = ?",
+                                (assignment.run_id,),
                             )
-                        any_wait_resolved = True
+                            txn.execute(
+                                "UPDATE parent_slots SET state = 'running', updated_at = ? WHERE node_id = ? AND state != 'released'",
+                                (now, assignment.node_id),
+                            )
+                            if assignment.member_id:
+                                txn.execute(
+                                    "UPDATE dispatch_group_members SET state = 'running', updated_at = ? WHERE member_id = ?",
+                                    (now, assignment.member_id),
+                                )
+                            any_wait_resolved = True
 
         # Handle direct cancel_requested_at on turns if no control_commands row existed
         if t_row and t_row["cancel_requested_at"]:
@@ -1363,6 +1572,9 @@ class WorkerRunner:
                         in_wait = True
                         if callable(self.on_wait):
                             self.on_wait(assignment, handle)
+                    elif ev.kind == "wait_resolved":
+                        if not turn_terminal_seen and self._resolve_wait_from_event(assignment, handle, ev):
+                            in_wait = False
                     elif ev.kind == "turn.terminal":
                         if ev.outcome:
                             terminal_outcome = str(ev.outcome)
@@ -1381,6 +1593,18 @@ class WorkerRunner:
 
                 if turn_terminal_seen and not in_wait:
                     break
+
+                if not events and getattr(self.driver, "driver_kind", None) == "zcode":
+                    conns = getattr(self.driver, "_connections", {})
+                    conn_obj = conns.get(handle.runtime_instance_id) if isinstance(conns, Mapping) else None
+                    if conn_obj is not None and (
+                        conn_obj.closed
+                        or conn_obj.eof_reached
+                        or (conn_obj.proc is not None and conn_obj.proc.poll() is not None and not conn_obj.event_queue)
+                    ):
+                        if not turn_terminal_seen:
+                            terminal_outcome = "failed"
+                        break
 
                 if in_wait:
                     time.sleep(min(0.025, self.poll_interval_ms / 1000.0))

@@ -28,7 +28,7 @@ COMM_SQL = {
     "toChildQueued": "SELECT COUNT(*) FROM inbox_messages WHERE target_node_id=? AND state IN ('queued','claimed')",
     "waitingInput": (
         "SELECT EXISTS(SELECT 1 FROM turns WHERE node_id=? AND execution_state='waiting_input') "
-        "OR EXISTS(SELECT 1 FROM wait_requests WHERE node_id=? AND state IN ('open','responding'))"
+        "OR EXISTS(SELECT 1 FROM wait_requests WHERE node_id=? AND state IN ('open','responding','unknown'))"
     ),
     "reportPendingAck": (
         "SELECT EXISTS(SELECT 1 FROM outbox_events WHERE child_node_id=? AND kind='terminal' AND state!='acked')"
@@ -511,7 +511,7 @@ class ProjectionReader:
             waiting_input_kind: str | None = None
             if has_wait_table:
                 w_open = state_conn.execute(
-                    "SELECT wait_id, kind FROM wait_requests WHERE node_id=? AND state IN ('open','responding') ORDER BY created_at DESC LIMIT 1",
+                    "SELECT wait_id, kind FROM wait_requests WHERE node_id=? AND state IN ('open','responding','unknown') ORDER BY created_at DESC LIMIT 1",
                     (node_id,),
                 ).fetchone()
                 if w_open is not None:

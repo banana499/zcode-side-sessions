@@ -1,7 +1,7 @@
 {
   "name": "side-sessions",
-  "version": "0.2.1",
-  "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
+  "version": "0.3.0",
+  "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, native session guard coexistence, and zero-ASAR-patch L1 persistent sidebar tree UI for ZCode (verified on ZCode 3.17.2 - 3.18.2).",
   "author": {
     "name": "banana499"
   },

@@ -1,15 +1,15 @@
 {
   "name": "side-sessions-marketplace",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "displayName": "Side Sessions Marketplace",
   "displayName_i18n": {
     "en": "Side Sessions Marketplace",
     "zh-CN": "Side Sessions 多会话树插件市场"
   },
-  "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
+  "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, native session guard coexistence, and zero-ASAR-patch L1 persistent sidebar tree UI for ZCode (verified on ZCode 3.17.2 - 3.18.2).",
   "description_i18n": {
-    "en": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
-    "zh-CN": "面向 ZCode 的 Claude Desktop 风格多会话树插件：支持每父会话 4 槽并发派发、只读沙箱与仓库外独立 Git Worktree 隔离、零污染 merge-tree 代码合并闭环及 macOS 左侧边栏原位可折叠会话树。"
+    "en": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, native session guard coexistence, and zero-ASAR-patch L1 persistent sidebar tree UI for ZCode (verified on ZCode 3.17.2 - 3.18.2).",
+    "zh-CN": "面向 ZCode（已适配验证 3.17.2 – 3.18.2）的 Claude Desktop 风格多会话树插件：支持每父会话 4 槽并发派发、只读沙箱与仓库外独立 Git Worktree 隔离、零污染 merge-tree 代码合并、原生 Session 工具防脑裂协同，以及免改包免重启 L1 主进程常驻左侧边栏可折叠会话树。"
   },
   "owner": {
     "name": "banana499"
@@ -20,17 +20,17 @@
   "plugins": [
     {
       "name": "side-sessions",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "source": "./",
       "displayName": "Side Sessions",
       "displayName_i18n": {
         "en": "Side Sessions",
         "zh-CN": "多会话树与并行子任务 (Side Sessions)"
       },
-      "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
+      "description": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, native session guard coexistence, and zero-ASAR-patch L1 persistent sidebar tree UI for ZCode (verified on ZCode 3.17.2 - 3.18.2).",
       "description_i18n": {
-        "en": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, and collapsible sidebar tree UI for ZCode.",
-        "zh-CN": "面向 ZCode 的 Claude Desktop 风格多会话树插件：支持每父会话 4 槽并发派发、只读沙箱与仓库外独立 Git Worktree 隔离、零污染 merge-tree 代码合并闭环及 macOS 左侧边栏原位可折叠会话树。"
+        "en": "Claude Desktop-style multi-session tree, isolated Git worktree parallel subtasks, lossless merge-tree integration, native session guard coexistence, and zero-ASAR-patch L1 persistent sidebar tree UI for ZCode (verified on ZCode 3.17.2 - 3.18.2).",
+        "zh-CN": "面向 ZCode（已适配验证 3.17.2 – 3.18.2）的 Claude Desktop 风格多会话树插件：支持每父会话 4 槽并发派发、只读沙箱与仓库外独立 Git Worktree 隔离、零污染 merge-tree 代码合并、原生 Session 工具防脑裂协同，以及免改包免重启 L1 主进程常驻左侧边栏可折叠会话树。"
       },
       "author": {
         "name": "banana499"

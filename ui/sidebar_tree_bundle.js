@@ -725,6 +725,7 @@ li[data-ss-has-children="true"] div.flex.min-w-0.items-center > p.min-w-0.flex-1
     let activeTaskId = null;
     const parts = [];
     for (const m of mounts || []) {
+      if (m.hostId && m.hostId !== 'local') continue;
       const st = (A.readActive && A.readActive(m)) || {};
       const isAct = st.isWorkspaceActive !== false;
       if (isAct && st.activeTaskId && !activeTaskId) {
@@ -1049,7 +1050,23 @@ li[data-ss-has-children="true"] div.flex.min-w-0.items-center > p.min-w-0.flex-1
     alive: true,
     update(next) {
       if (!next || next.schemaVersion !== 1) return { ok: false, code: 'BAD_SCHEMA' };
-      if (snap && next.projectionRevision === snap.projectionRevision) return { ok: true, unchanged: true };
+      if (
+        snap &&
+        next.storeInstanceId === snap.storeInstanceId &&
+        next.projectionRevision === snap.projectionRevision
+      ) {
+        return { ok: true, unchanged: true };
+      }
+      if (snap && next.storeInstanceId !== snap.storeInstanceId) {
+        actionQueue.length = 0;
+        actionQueuedAtById.clear();
+        inflightActionByNode.clear();
+        lastActionErrorByNode.clear();
+        copiedWaitUntilByNode.clear();
+        bySid.clear();
+        byNodeId.clear();
+        kids.clear();
+      }
       snap = next;
       bySid = new Map();
       byNodeId = new Map();
@@ -1081,13 +1098,31 @@ li[data-ss-has-children="true"] div.flex.min-w-0.items-center > p.min-w-0.flex-1
     ackActions,
     getStatus() {
       pruneExpiredState();
-      const sc = A ? A.selfCheck() : {};
+      const sc = A
+        ? typeof A.selfCheck === 'function'
+          ? A.selfCheck()
+          : typeof A.selfTest === 'function'
+            ? A.selfTest()
+            : {}
+        : {};
       return {
         alive: Boolean(api.alive),
         version: VERSION,
         adapterId: A && A.id,
+        contractId: (A && A.contractId) || (sc && sc.contractId) || null,
         ...sc,
+        selfTest:
+          sc && sc.state
+            ? {
+                state: sc.state,
+                capabilities: sc.capabilities,
+                diagnostics: sc.diagnostics,
+              }
+            : null,
+        storeInstanceId: snap ? snap.storeInstanceId ?? null : null,
         projectionRevision: snap && snap.projectionRevision,
+        transportOwner: G.__SS_TRANSPORT_OWNER__ || null,
+        bootNonce: G.__SS_BOOT_NONCE__ || null,
         mountedParentCount: hosts.size,
         childCount: snap ? (snap.nodes || []).filter(n => n.parentNodeId).length : 0,
         activeTaskId: lastActive,
@@ -1136,9 +1171,13 @@ li[data-ss-has-children="true"] div.flex.min-w-0.items-center > p.min-w-0.flex-1
       }
       decoratedParents.clear();
       if (typeof document !== 'undefined') {
-        const ov = document.getElementById('ss-overlay-root');
+        const ov = typeof document.getElementById === 'function' ? document.getElementById('ss-overlay-root') : null;
         if (ov && typeof ov.remove === 'function') ov.remove();
-        document.querySelectorAll(`[${OWN}]`).forEach(e => e.remove());
+        const stEl = typeof document.getElementById === 'function' ? document.getElementById(STYLE_ID) : null;
+        if (stEl && typeof stEl.remove === 'function') stEl.remove();
+        if (typeof document.querySelectorAll === 'function') {
+          document.querySelectorAll(`[${OWN}]`).forEach(e => e.remove());
+        }
       }
       for (const r of restore) {
         if (r.prevValue === null) r.el.removeAttribute(r.attr);
@@ -1147,12 +1186,22 @@ li[data-ss-has-children="true"] div.flex.min-w-0.items-center > p.min-w-0.flex-1
       restore.length = 0;
       hosts.clear();
       delete G.__SS_SIDEBAR_TREE__;
+      delete G.__SS_ZCODE_ADAPTER__;
     },
   };
 
   G.__SS_SIDEBAR_TREE__ = api;
   if (!A) {
-    api.getStatus = () => ({ alive: false, version: VERSION, lastError: 'ADAPTER_MISSING' });
+    api.getStatus = () => ({
+      alive: false,
+      version: VERSION,
+      contractId: null,
+      selfTest: null,
+      storeInstanceId: null,
+      transportOwner: G.__SS_TRANSPORT_OWNER__ || null,
+      bootNonce: G.__SS_BOOT_NONCE__ || null,
+      lastError: 'ADAPTER_MISSING',
+    });
     return;
   }
   if (typeof document !== 'undefined') {

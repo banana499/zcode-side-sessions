@@ -21,6 +21,17 @@ description: 受控父子会话树、隔离工作区子任务与可恢复异步�
 1. **当前回合内即可完成的轻量操作**：单次文件读取、局部关键字搜索、简短状态查询或几步内即可同步返回结果的简单操作。
 2. **无需跨回合状态或工作区隔离**：不需要后续多轮追问跟进、不需要独立 Git worktree 隔离、也不会阻塞主会话响应的短期辅助查询。
 
+### 原生 Session 工具共存矩阵（单执行所有者门禁）
+在 `side-sessions` 协调上下文中，原生 Session 工具受确定性 `PreToolUse` 所有权门禁（`native_session_guard`）约束，严禁在插件调用失败、满槽或等待真人批准时擅自退回原生会话创建/发送工具：
+
+| 原生工具 | 协调上下文规则 | 替代途径与说明 |
+|---|---|---|
+| `CreateSession` / `ForkSession` | **默认阻止**（`continue: false`） | 必须改走 `start_session` 或 `hand_off_to_session`；严禁在插件调用失败后退回原生创建 |
+| `SendToSession` / `InterruptSession` | **受管目标阻止**（`continue: false`） | 必须改走 `send_message_to_session`（FIFO）或 `cancel_run`（受管等待改走 `/side-sessions:respond`） |
+| `SetSessionArchived` | **受管目标阻止**（`continue: false`） | 必须改走 `archive_session`（强制校验空闲条件并保留槽位/报告不变量） |
+| `RenameSession` | **受管目标阻止**（`continue: false`） | 防止宿主标题与插件 `nodes.title` 分裂 |
+| `ListProjects` / `ListSessions` / `ReadSession` / `OpenSession` / `SetSessionPinned` | **允许共存**（受既有 `read_only` 与任务冻结规则约束） | 用于未受管会话发现、只读查看、UI 导航与置顶（不获取插件执行所有权） |
+
 ---
 
 ## 2. 工具矩阵与调用规范
@@ -144,12 +155,12 @@ description: 受控父子会话树、隔离工作区子任务与可恢复异步�
 
 #### 4) 等待输入响应与取消控制（R04）
 - `list_waits(session_id: UUID) -> list[WaitSummary]`：
-  - 查询目标会话当前处于 `open` 状态的等待请求（`wait_id`、`run_id`、`kind: 'input' | 'elicitation' | 'permission'`、`nonce`、`question`、`options`、`required_authority`、`deadline_at`）。
+  - 查询目标会话当前处于未终态（`open` / `responding` / `unknown`）的等待请求（`wait_id`、`run_id`、`kind: 'input' | 'elicitation' | 'permission'`、`nonce`、`question`、`options`、`required_authority`、`deadline_at`、`state`）。其中 `unknown` 表示已向原连接写入响应、正等待宿主真实解决事件（`permission.resolved` / `userInput.resolved`）确认，可见但**不可重复应答**（再调用将返回 `WAIT_ALREADY_RESPONDED`）。
 - `get_control(control_id: UUID) -> ControlResult`：
-  - 按 `control_id` 查询控制命令回执（`respond_wait` / `cancel_run` 等），用于核对 `applied` / `WAIT_STALE` / `WAIT_RESPONSE_UNAVAILABLE`。
+  - 按 `control_id` 查询控制命令回执（`respond_wait` / `cancel_run` 等），用于核对 `unknown` / `applied` / `rejected` / `WAIT_STALE` / `WAIT_RESPONSE_UNAVAILABLE`。
 - `respond_to_wait(request_id: UUID, wait_id: UUID, nonce: str, response: WaitResponse) -> ControlResult`：
   - 针对处于 `waiting_input` 的子会话，通过原执行连接投递回复（`input` / `elicitation` / `permission`）。
-  - **关键限制**：严禁用 `send_message_to_session` 回复当前等待（普通 FIFO 消息仅用于下一回合）；`permission` 决策及 `required_authority="human"` 的等待必须经真人执行 `/side-sessions:respond <wait_id> <answer>` 由 `UserPromptSubmit` Hook 同事务验真并投递（模型看到 `<system-reminder>` 后严禁再调 `respond_to_wait`；模型直接无凭据调用将返回 `USER_APPROVAL_REQUIRED` / `HUMAN_ACTION_REQUIRED`）。
+  - **关键限制**：严禁用 `send_message_to_session` 回复当前等待（普通 FIFO 消息仅用于下一回合）；`permission`、`AskUserQuestion` 与 `plan_approval` 等 `required_authority="human"` 的等待必须经真人执行 `/side-sessions:respond <wait_id> <answer>` 由 `UserPromptSubmit` Hook 同事务验真规范化并投递（模型看到 `<system-reminder>` 后严禁再调 `respond_to_wait`；模型直接无凭据调用将返回 `USER_APPROVAL_REQUIRED` / `HUMAN_ACTION_REQUIRED`）。
 - `cancel_run(request_id: UUID, session_id: UUID, run_id: UUID, reason: str) -> ControlResult`：
   - 请求停止指定运行回合（`reason` 非空）。状态先进入 `stopping`，由当前 owner 执行协议停止与进程树回收，仅在 `exit_confirmed=true` 后才进入 `cancelled` 并释放执行槽位。
 - `cancel_message(request_id: UUID, session_id: UUID, message_id: UUID, reason: str) -> QueueResult`：

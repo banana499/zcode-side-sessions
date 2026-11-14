@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
+import copy
 from dataclasses import dataclass, field
 import json
 import os
@@ -176,6 +177,7 @@ class WaitResponse(_SerializableMixin):
     text: str | None = None
     action: str | None = None
     content: Any = None
+    reason: str | None = None
     option_id: str | None = None
     decision: str | None = None
 
@@ -187,6 +189,8 @@ class WaitResponse(_SerializableMixin):
             raw["action"] = self.action
             if self.content is not None:
                 raw["content"] = self.content
+            if self.reason is not None:
+                raw["reason"] = self.reason
         elif self.kind == "permission":
             raw["option_id"] = self.option_id
             raw["decision"] = self.decision
@@ -1327,6 +1331,8 @@ class _AppServerConnection:
     event_queue: deque[RuntimeEvent] = field(default_factory=deque)
     pending_waits: dict[str, dict[str, Any]] = field(default_factory=dict)
     sent_inputs: list[dict[str, Any]] = field(default_factory=list)
+    write_lock: threading.Lock = field(default_factory=threading.Lock)
+    eof_reached: bool = False
     closed: bool = False
     exit_code: int | None = None
 
@@ -1358,6 +1364,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         self._lock = threading.RLock()
         self._connections: dict[str, _AppServerConnection] = {}
         self._stdout_queues: dict[int, queue.Queue[bytes | None]] = {}
+        self._write_locks: dict[int, threading.Lock] = {}
         self._captured_chains: dict[tuple[str, str], tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
         self._in_memory_source_sessions: dict[str, dict[str, Any]] = {}
 
@@ -1400,6 +1407,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             )
             q: queue.Queue[bytes | None] = queue.Queue()
             self._stdout_queues[proc.pid] = q
+            self._write_locks[proc.pid] = threading.Lock()
 
             def _reader_loop() -> None:
                 assert proc.stdout is not None
@@ -1426,31 +1434,388 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 {"zcode_bin": self.zcode_bin, "error": str(exc)},
             ) from exc
 
-    def _maybe_reply_server_request(
+    def _get_write_lock(
+        self,
+        proc: subprocess.Popen[bytes],
+        rpc_state: Mapping[str, Any] | None = None,
+    ) -> threading.Lock:
+        if isinstance(rpc_state, Mapping) and isinstance(rpc_state.get("write_lock"), type(threading.Lock())):
+            return rpc_state["write_lock"]  # type: ignore[return-value]
+        pid = getattr(proc, "pid", None)
+        if pid is not None:
+            with self._lock:
+                lk = self._write_locks.get(pid)
+                if lk is None:
+                    lk = threading.Lock()
+                    self._write_locks[pid] = lk
+                return lk
+        return threading.Lock()
+
+    def _write_json_line(
+        self,
+        proc: subprocess.Popen[bytes],
+        obj: Mapping[str, Any],
+        *,
+        write_lock: threading.Lock | None = None,
+    ) -> None:
+        if proc.stdin is None:
+            raise OSError("app-server stdin is closed")
+        line = (canonical_json(dict(obj)) + "\n").encode("utf-8")
+        lk = write_lock or self._get_write_lock(proc)
+        with lk:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+
+    def _send_reverse_error(
+        self,
+        proc: subprocess.Popen[bytes],
+        msg_id: Any,
+        code: int,
+        message: str,
+        *,
+        write_lock: threading.Lock | None = None,
+    ) -> None:
+        if proc.stdin is None:
+            return
+        try:
+            self._write_json_line(
+                proc,
+                {"id": msg_id, "error": {"code": code, "message": message}},
+                write_lock=write_lock,
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _normalize_permission_options(raw_options: Any) -> list[dict[str, Any]]:
+        norm: list[dict[str, Any]] = []
+        if not isinstance(raw_options, list):
+            return norm
+        for opt in raw_options:
+            if not isinstance(opt, Mapping):
+                continue
+            oid = str(opt.get("optionId") or opt.get("option_id") or opt.get("id") or "").strip()
+            resp_val = dict(opt["response"]) if isinstance(opt.get("response"), Mapping) else {}
+            dec = str(resp_val.get("decision") or opt.get("decision") or opt.get("kind") or "").strip()
+            item: dict[str, Any] = {
+                "optionId": oid,
+                "option_id": oid,
+                "kind": str(opt.get("kind") or ""),
+                "name": str(opt.get("name") or opt.get("label") or oid),
+                "decision": dec,
+                "response": resp_val,
+            }
+            if opt.get("description") is not None:
+                item["description"] = str(opt.get("description") or "")
+            norm.append(item)
+        return norm
+
+    @staticmethod
+    def _normalize_user_input_request(params: Mapping[str, Any]) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None, str]:
+        schema_obj = params.get("schema") if isinstance(params.get("schema"), Mapping) else {}
+        req_schema = schema_obj.get("requestedSchema") if isinstance(schema_obj.get("requestedSchema"), Mapping) else None
+        if req_schema is None and isinstance(params.get("requestedSchema"), Mapping):
+            req_schema = params.get("requestedSchema")
+        if req_schema is None and isinstance(params.get("input"), Mapping) and isinstance(params["input"].get("requestedSchema"), Mapping):
+            req_schema = params["input"]["requestedSchema"]
+        tool_name = str(params.get("toolName") or params.get("tool_name") or schema_obj.get("toolName") or "").strip()
+        interaction_tag = str(schema_obj.get("interaction") or "").strip()
+        origin_val = str(params.get("origin") or "").strip()
+
+        if interaction_tag == "mcp_elicitation" or tool_name == "McpElicitation" or origin_val == "mcp_elicitation" or req_schema is not None:
+            subtype = "mcp_elicitation"
+        elif interaction_tag == "plan_approval" or tool_name in ("ExitPlanMode", "plan_approval") or origin_val == "plan_approval":
+            subtype = "plan_approval"
+        elif tool_name == "AskUserQuestion" or isinstance(params.get("questions"), list):
+            subtype = "ask_user_question"
+        else:
+            subtype = "user_input"
+
+        norm_questions: list[dict[str, Any]] = []
+        raw_questions = params.get("questions")
+        if isinstance(raw_questions, list):
+            for q in raw_questions:
+                if not isinstance(q, Mapping):
+                    continue
+                q_opts: list[dict[str, Any]] = []
+                for o in (q.get("options") or []):
+                    if not isinstance(o, Mapping):
+                        continue
+                    o_val = str(o.get("value") if o.get("value") is not None else (o.get("label") or o.get("name") or ""))
+                    o_lbl = str(o.get("label") or o.get("name") or o_val)
+                    qo: dict[str, Any] = {"value": o_val, "label": o_lbl}
+                    if o.get("description") is not None:
+                        qo["description"] = str(o.get("description") or "")
+                    q_opts.append(qo)
+                norm_questions.append({
+                    "question": str(q.get("question") or ""),
+                    "header": str(q.get("header") or ""),
+                    "multiSelect": bool(q.get("multiSelect", False)),
+                    "options": q_opts,
+                })
+
+        norm_opts: list[dict[str, Any]] = []
+        if subtype == "plan_approval":
+            raw_plan_opts = params.get("options") if isinstance(params.get("options"), list) else (
+                norm_questions[0]["options"] if norm_questions else []
+            )
+            q_text = norm_questions[0]["question"] if norm_questions else str(params.get("prompt") or "")
+            for o in raw_plan_opts:
+                if isinstance(o, Mapping):
+                    o_val = str(o.get("value") if o.get("value") is not None else (o.get("label") or o.get("name") or ""))
+                    o_lbl = str(o.get("label") or o.get("name") or o_val)
+                    po: dict[str, Any] = {
+                        "kind": "plan_option",
+                        "subtype": "plan_approval",
+                        "value": o_val,
+                        "label": o_lbl,
+                        "question": q_text,
+                    }
+                    if o.get("description") is not None:
+                        po["description"] = str(o.get("description") or "")
+                    norm_opts.append(po)
+        elif subtype == "mcp_elicitation":
+            norm_opts.append({
+                "kind": "schema",
+                "subtype": "mcp_elicitation",
+                "requestedSchema": dict(req_schema) if isinstance(req_schema, Mapping) else None,
+                "questions": norm_questions,
+            })
+        elif norm_questions:
+            for q in norm_questions:
+                norm_opts.append({
+                    "kind": "question",
+                    "subtype": subtype,
+                    "question": q["question"],
+                    "header": q["header"],
+                    "multiSelect": q["multiSelect"],
+                    "options": q["options"],
+                })
+        elif isinstance(params.get("options"), list):
+            for o in params["options"]:
+                if isinstance(o, Mapping):
+                    o_val = str(o.get("value") if o.get("value") is not None else (o.get("label") or o.get("name") or ""))
+                    o_lbl = str(o.get("label") or o.get("name") or o_val)
+                    norm_opts.append({"value": o_val, "label": o_lbl})
+                elif isinstance(o, str):
+                    norm_opts.append({"value": o, "label": o})
+
+        req_auth = (
+            "human"
+            if (subtype in ("ask_user_question", "plan_approval") or params.get("required_authority") == "human")
+            else "parent_agent_allowed"
+        )
+        q_summary = str(
+            params.get("prompt")
+            or (norm_questions[0]["question"] if norm_questions else "")
+            or "User input requested"
+        ).strip()
+        req_schema_dict = dict(req_schema) if isinstance(req_schema, Mapping) else None
+        return subtype, req_auth, norm_questions, norm_opts, req_schema_dict, q_summary
+
+    def _handle_reverse_request(
         self,
         proc: subprocess.Popen[bytes],
         msg: Mapping[str, Any],
+        *,
+        rpc_state: dict[str, Any] | None = None,
+        event_sink: deque[RuntimeEvent] | None = None,
+        runtime_sid: str = "",
     ) -> bool:
-        """Reply to reverse RPC requests (`id` starting with `'server'`) sent by `zcode app-server`."""
+        """Handle server-initiated JSON-RPC reverse requests (`interaction/*`, `session/requestRuntimePreferences`, etc.)."""
         mid = msg.get("id")
         method = msg.get("method")
-        if mid is None or not isinstance(method, str) or not str(mid).startswith("server"):
+        if mid is None or not isinstance(method, str) or not method.strip():
             return False
+
+        w_lock = self._get_write_lock(proc, rpc_state)
+
         if method == "session/requestRuntimePreferences":
             result: dict[str, Any] = {
                 "nativeSearchEnhancementsEnabled": False,
                 "memoryEnabled": False,
-                "askUserQuestionAutoResolutionEnabled": True,
+                "askUserQuestionAutoResolutionEnabled": False,
+                "appControlEnabled": False,
             }
-        else:
-            result = {"headers": {}}
-        if proc.stdin is not None:
-            try:
-                reply = (canonical_json({"id": mid, "result": result}) + "\n").encode("utf-8")
-                proc.stdin.write(reply)
-                proc.stdin.flush()
-            except OSError:
-                pass
+            if proc.stdin is not None:
+                try:
+                    self._write_json_line(proc, {"id": mid, "result": result}, write_lock=w_lock)
+                except OSError:
+                    pass
+            return True
+
+        if method in ("interaction/requestProviderRuntimeHeaders", "provider/requestRuntimeHeaders"):
+            # Strict discriminated union per zcode.cjs `zun`: {headersApplied: false, errorMessage?: string}
+            # Note: NEVER return {headers: {}}.
+            err_result: dict[str, Any] = {
+                "headersApplied": False,
+                "errorMessage": "provider_auth_delegation_unsupported",
+            }
+            if proc.stdin is not None:
+                try:
+                    self._write_json_line(proc, {"id": mid, "result": err_result}, write_lock=w_lock)
+                except OSError:
+                    pass
+            return True
+
+        if method == "interaction/requestOfficialMcpAuthHeaders":
+            mcp_result: dict[str, Any] = {
+                "ok": False,
+                "reason": "official_auth_unavailable",
+            }
+            if proc.stdin is not None:
+                try:
+                    self._write_json_line(proc, {"id": mid, "result": mcp_result}, write_lock=w_lock)
+                except OSError:
+                    pass
+            return True
+
+        if method in ("interaction/requestPermission", "interaction/requestUserInput"):
+            params = msg.get("params")
+            if not isinstance(params, Mapping):
+                self._send_reverse_error(proc, mid, -32602, f"Invalid params for {method}", write_lock=w_lock)
+                return True
+
+            expected_sid = str(
+                runtime_sid
+                or (rpc_state.get("runtime_sid") if isinstance(rpc_state, Mapping) else "")
+                or ""
+            ).strip()
+            req_sid = str(params.get("sessionId") or params.get("session_id") or "").strip()
+            if not req_sid or (expected_sid and req_sid != expected_sid):
+                self._send_reverse_error(
+                    proc,
+                    mid,
+                    -32602,
+                    f"sessionId mismatch for {method}: got {req_sid!r}, expected {expected_sid!r}",
+                    write_lock=w_lock,
+                )
+                return True
+
+            request_id = str(params.get("requestId") or "").strip()
+            if not request_id:
+                self._send_reverse_error(
+                    proc,
+                    mid,
+                    -32602,
+                    f"Missing params.requestId for {method}",
+                    write_lock=w_lock,
+                )
+                return True
+
+            inst_id = str(
+                (rpc_state.get("runtime_instance_id") if isinstance(rpc_state, Mapping) else "")
+                or ""
+            ).strip()
+            pending_waits = (
+                rpc_state["pending_waits"]
+                if (isinstance(rpc_state, dict) and isinstance(rpc_state.get("pending_waits"), dict))
+                else {}
+            )
+            params_hash = canonical_json_sha256({"method": method, "params": dict(params)})
+
+            existing = pending_waits.get(request_id)
+            if existing is not None:
+                if (
+                    existing.get("paramsHash") != params_hash
+                    or existing.get("method") != method
+                    or existing.get("sessionId") != req_sid
+                    or (inst_id and existing.get("runtime_instance_id") != inst_id)
+                ):
+                    self._send_reverse_error(
+                        proc,
+                        mid,
+                        -32602,
+                        f"Conflicting params for re-announced requestId {request_id}",
+                        write_lock=w_lock,
+                    )
+                    return True
+                aliases = existing.setdefault("aliases", [])
+                if mid not in aliases:
+                    aliases.append(mid)
+                existing["latestRpcId"] = mid
+                return True
+
+            turn_id = str(params.get("turnId") or params.get("turn_id") or "") or None
+            tool_call_id = str(params.get("toolCallId") or params.get("tool_call_id") or "") or None
+
+            if method == "interaction/requestPermission":
+                norm_opts = self._normalize_permission_options(params.get("options"))
+                tool_name = str(params.get("toolName") or params.get("tool_name") or "").strip()
+                reason = str(params.get("reason") or "").strip()
+                question = (
+                    f"{tool_name}: {reason}"
+                    if (tool_name and reason)
+                    else (reason or (f"Permission required for {tool_name}" if tool_name else "Permission required"))
+                )
+                w_req: dict[str, Any] = {
+                    "host_request_id": request_id,
+                    "kind": "permission",
+                    "question": question,
+                    "options": norm_opts,
+                    "required_authority": "human",
+                    "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "risk_level": str(params.get("riskLevel") or ""),
+                }
+            else:
+                subtype, req_auth, norm_questions, norm_opts, req_schema_dict, q_summary = (
+                    self._normalize_user_input_request(params)
+                )
+                tool_name = str(params.get("toolName") or params.get("tool_name") or "").strip()
+                w_req = {
+                    "host_request_id": request_id,
+                    "kind": "elicitation",
+                    "subtype": subtype,
+                    "question": q_summary,
+                    "questions": norm_questions,
+                    "options": norm_opts,
+                    "required_authority": req_auth,
+                    "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                }
+                if req_schema_dict is not None:
+                    w_req["requestedSchema"] = req_schema_dict
+
+            pending_waits[request_id] = {
+                "key": (inst_id, req_sid, request_id),
+                "runtime_instance_id": inst_id,
+                "sessionId": req_sid,
+                "requestId": request_id,
+                "method": method,
+                "params": copy.deepcopy(dict(params)),
+                "paramsHash": params_hash,
+                "turnId": turn_id,
+                "toolCallId": tool_call_id,
+                "aliases": [mid],
+                "latestRpcId": mid,
+                "sentResult": None,
+                "controlId": None,
+            }
+
+            if event_sink is not None:
+                event_sink.append(
+                    RuntimeEvent(
+                        event_id=request_id,
+                        runtime_sid=req_sid,
+                        kind="wait_request",
+                        runtime_turn_id=turn_id,
+                        status="waiting_input",
+                        wait_request=w_req,
+                        payload={
+                            "request_id": request_id,
+                            "turn_id": turn_id,
+                            "tool_call_id": tool_call_id,
+                            "method": method,
+                        },
+                        timestamp=utc_now_iso(),
+                    )
+                )
+            return True
+
+        self._send_reverse_error(proc, mid, -32601, f"Method not found: {method}", write_lock=w_lock)
         return True
 
     def _resolve_default_model_from_sqlite(self, parent_runtime_sid: str | None = None) -> dict[str, Any]:
@@ -1542,6 +1907,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         *,
         event_sink: deque[RuntimeEvent] | None = None,
         runtime_sid: str = "",
+        rpc_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if proc.stdin is None or proc.stdout is None:
             raise SideSessionError(ErrorCode.CAPABILITY_UNAVAILABLE, "app-server stdio pipes are closed")
@@ -1552,10 +1918,9 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             "method": method,
             "params": dict(params),
         }
-        line = (canonical_json(rpc_msg) + "\n").encode("utf-8")
+        w_lock = self._get_write_lock(proc, rpc_state)
         try:
-            proc.stdin.write(line)
-            proc.stdin.flush()
+            self._write_json_line(proc, rpc_msg, write_lock=w_lock)
         except OSError as exc:
             raise SideSessionError(
                 ErrorCode.RETRY_LATER,
@@ -1600,7 +1965,13 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 continue
             if not isinstance(msg, Mapping):
                 continue
-            if self._maybe_reply_server_request(proc, msg):
+            if self._handle_reverse_request(
+                proc,
+                msg,
+                rpc_state=rpc_state,
+                event_sink=event_sink,
+                runtime_sid=runtime_sid,
+            ):
                 continue
             msg_id = msg.get("id")
             if str(msg_id or "") == req_id or (msg_id is None and "error" in msg and msg["error"] is not None):
@@ -1744,6 +2115,34 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     status="waiting_input",
                     wait_request=w_dict,
                     payload=merged_params,
+                    timestamp=now,
+                )
+            if ev_type in ("permission.resolved", "userInput.resolved", "PermissionResolved", "PermissionDenied"):
+                ev_id = str(merged_params.get("eventId") or merged_params.get("id") or uuid.uuid4())
+                req_id_val = str(merged_params.get("requestId") or merged_params.get("request_id") or "").strip() or None
+                tc_id_val = str(merged_params.get("toolCallId") or merged_params.get("tool_call_id") or "").strip() or None
+                t_id_val = str(merged_params.get("turnId") or merged_params.get("runtime_turn_id") or "").strip() or None
+                res_dict = {
+                    k: merged_params[k]
+                    for k in ("decision", "reason", "cancelled", "value", "modifiedInput", "toolName")
+                    if k in merged_params
+                }
+                if ev_type == "PermissionDenied" and "decision" not in res_dict:
+                    res_dict["decision"] = "deny"
+                return RuntimeEvent(
+                    event_id=ev_id,
+                    runtime_sid=sid,
+                    kind="wait_resolved",
+                    runtime_turn_id=t_id_val,
+                    status=None,
+                    payload={
+                        "request_id": req_id_val,
+                        "tool_call_id": tc_id_val,
+                        "turn_id": t_id_val,
+                        "event_id": ev_id,
+                        "event_type": ev_type,
+                        "resolution": res_dict,
+                    },
                     timestamp=now,
                 )
             if ev_type in ("session/status", "session.status", "status_patch", "idle") or "status" in merged_params:
@@ -1921,6 +2320,8 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             if default_model:
                 payload["model"] = default_model
         expected_ws = payload["workspace"]["workspacePath"]
+        instance_id = str(uuid.uuid4())
+        conn_id = f"conn:{instance_id}"
         proc = self._spawn_app_server(cwd=expected_ws)
         pid = proc.pid
         lstart = get_process_lstart(pid)
@@ -1930,6 +2331,12 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             pgid = pid
 
         event_q: deque[RuntimeEvent] = deque()
+        rpc_state: dict[str, Any] = {
+            "runtime_instance_id": instance_id,
+            "runtime_sid": payload["sessionId"],
+            "pending_waits": {},
+            "write_lock": self._get_write_lock(proc),
+        }
         try:
             try:
                 resp = self._rpc_call(
@@ -1938,6 +2345,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     payload,
                     event_sink=event_q,
                     runtime_sid=payload["sessionId"],
+                    rpc_state=rpc_state,
                 )
             except SideSessionError as create_exc:
                 if payload.get("model") and (
@@ -1966,12 +2374,19 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     except OSError:
                         pgid = pid
                     event_q.clear()
+                    rpc_state = {
+                        "runtime_instance_id": instance_id,
+                        "runtime_sid": payload["sessionId"],
+                        "pending_waits": {},
+                        "write_lock": self._get_write_lock(proc),
+                    }
                     resp = self._rpc_call(
                         proc,
                         "session/create",
                         payload,
                         event_sink=event_q,
                         runtime_sid=payload["sessionId"],
+                        rpc_state=rpc_state,
                     )
                 else:
                     raise
@@ -1987,6 +2402,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             if not isinstance(sess_obj, Mapping):
                 sess_obj = {}
             returned_sid = str(sess_obj.get("id") or sess_obj.get("sessionId") or payload["sessionId"])
+            rpc_state["runtime_sid"] = returned_sid
             self._verify_runtime_config(sess_obj, spec, actual_ws=actual_ws, expected_ws=expected_ws)
             returned_parent = sess_obj.get("parentSessionId") or sess_obj.get("parent_id")
             if returned_parent is not None and str(returned_parent) != spec.parent_runtime_sid:
@@ -2002,6 +2418,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                         {"sessionId": returned_sid, "model": payload["model"]},
                         event_sink=event_q,
                         runtime_sid=returned_sid,
+                        rpc_state=rpc_state,
                     )
                 except SideSessionError:
                     pass
@@ -2022,8 +2439,6 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     pass
             raise
 
-        instance_id = str(uuid.uuid4())
-        conn_id = f"conn:{instance_id}"
         conn_state = _AppServerConnection(
             runtime_sid=returned_sid,
             runtime_instance_id=instance_id,
@@ -2042,6 +2457,8 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             revision=revision,
             status="idle",
             event_queue=event_q,
+            pending_waits=rpc_state["pending_waits"],
+            write_lock=rpc_state["write_lock"],
         )
         with self._lock:
             self._connections[instance_id] = conn_state
@@ -2069,6 +2486,8 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             if default_model:
                 payload["model"] = default_model
         proc = self._spawn_app_server(cwd=expected_ws)
+        instance_id = str(uuid.uuid4())
+        conn_id = f"conn:{instance_id}"
         pid = proc.pid
         lstart = get_process_lstart(pid)
         try:
@@ -2077,6 +2496,12 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             pgid = pid
 
         event_q: deque[RuntimeEvent] = deque()
+        rpc_state: dict[str, Any] = {
+            "runtime_instance_id": instance_id,
+            "runtime_sid": spec.assignment.runtime_sid,
+            "pending_waits": {},
+            "write_lock": self._get_write_lock(proc),
+        }
         try:
             resp = self._rpc_call(
                 proc,
@@ -2084,6 +2509,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 payload,
                 event_sink=event_q,
                 runtime_sid=spec.assignment.runtime_sid,
+                rpc_state=rpc_state,
             )
             actual_ws = extract_workspace_path(resp, kind="resume")
             if actual_ws != expected_ws:
@@ -2123,6 +2549,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                         {"sessionId": spec.assignment.runtime_sid, "model": payload["model"]},
                         event_sink=event_q,
                         runtime_sid=spec.assignment.runtime_sid,
+                        rpc_state=rpc_state,
                     )
                 except SideSessionError:
                     pass
@@ -2144,8 +2571,6 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     pass
             raise
 
-        instance_id = str(uuid.uuid4())
-        conn_id = f"conn:{instance_id}"
         conn_state = _AppServerConnection(
             runtime_sid=spec.assignment.runtime_sid,
             runtime_instance_id=instance_id,
@@ -2164,6 +2589,8 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             revision=revision,
             status="idle",
             event_queue=event_q,
+            pending_waits=rpc_state["pending_waits"],
+            write_lock=rpc_state["write_lock"],
         )
         with self._lock:
             self._connections[instance_id] = conn_state
@@ -2209,6 +2636,12 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             params["expectedRevision"] = input.expected_revision
 
         pre_q_len = len(conn.event_queue)
+        conn_rpc_state = {
+            "runtime_instance_id": conn.runtime_instance_id,
+            "runtime_sid": handle.runtime_sid,
+            "pending_waits": conn.pending_waits,
+            "write_lock": conn.write_lock,
+        }
         try:
             resp = self._rpc_call(
                 conn.proc,
@@ -2216,6 +2649,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 params,
                 event_sink=conn.event_queue,
                 runtime_sid=handle.runtime_sid,
+                rpc_state=conn_rpc_state,
             )
         except SideSessionError as exc:
             if "Reasoning level is required" in exc.message and conn.model:
@@ -2228,6 +2662,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                         {"sessionId": handle.runtime_sid, "model": fallback_model},
                         event_sink=conn.event_queue,
                         runtime_sid=handle.runtime_sid,
+                        rpc_state=conn_rpc_state,
                     )
                     conn.model = fallback_model
                 except SideSessionError:
@@ -2239,6 +2674,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     params,
                     event_sink=conn.event_queue,
                     runtime_sid=handle.runtime_sid,
+                    rpc_state=conn_rpc_state,
                 )
             else:
                 raise
@@ -2275,17 +2711,24 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
 
     def events(self, handle: RuntimeHandle) -> DualEventStream:
         conn = self._require_open_connection(handle)
+        conn_rpc_state = {
+            "runtime_instance_id": conn.runtime_instance_id,
+            "runtime_sid": handle.runtime_sid,
+            "pending_waits": conn.pending_waits,
+            "write_lock": conn.write_lock,
+        }
 
         def _next_event() -> RuntimeEvent | None:
             if conn.event_queue:
                 return conn.event_queue.popleft()
-            if conn.proc is None or conn.proc.stdout is None or conn.closed:
+            if conn.proc is None or conn.proc.stdout is None or conn.closed or conn.eof_reached:
                 return None
             q = self._stdout_queues.get(conn.proc.pid)
             deadline = time.monotonic() + 0.25
             first_wait = 0.1
             while time.monotonic() < deadline:
                 if conn.proc.poll() is not None and (q is None or q.empty()):
+                    conn.eof_reached = True
                     return None
                 wait_sec = first_wait if first_wait > 0 else max(0.0, min(0.02, deadline - time.monotonic()))
                 first_wait = 0.0
@@ -2303,6 +2746,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                         return None
                     raw_line = conn.proc.stdout.readline()
                 if not raw_line:
+                    conn.eof_reached = True
                     return None
                 try:
                     msg = json.loads(raw_line.decode("utf-8", errors="replace"))
@@ -2310,7 +2754,18 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     continue
                 if not isinstance(msg, Mapping):
                     continue
-                if self._maybe_reply_server_request(conn.proc, msg):
+                if self._handle_reverse_request(
+                    conn.proc,
+                    msg,
+                    rpc_state=conn_rpc_state,
+                    event_sink=conn.event_queue,
+                    runtime_sid=handle.runtime_sid,
+                ):
+                    if conn.event_queue:
+                        ev_from_rev = conn.event_queue.popleft()
+                        if ev_from_rev.kind == "wait_request":
+                            conn.status = "waiting_input"
+                        return ev_from_rev
                     continue
                 ev = self._parse_notification(msg, runtime_sid=handle.runtime_sid)
                 if ev is None:
@@ -2319,6 +2774,23 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                     conn.status = "idle"
                 elif ev.kind == "wait_request":
                     conn.status = "waiting_input"
+                elif ev.kind == "wait_resolved":
+                    req_id = ev.payload.get("request_id")
+                    if req_id:
+                        conn.pending_waits.pop(str(req_id), None)
+                    else:
+                        tc_id = ev.payload.get("tool_call_id")
+                        t_id = ev.payload.get("turn_id") or ev.runtime_turn_id
+                        if tc_id:
+                            matches = [
+                                k
+                                for k, v in conn.pending_waits.items()
+                                if v.get("toolCallId") == tc_id and (t_id is None or v.get("turnId") in (None, t_id))
+                            ]
+                            if len(matches) == 1:
+                                conn.pending_waits.pop(matches[0], None)
+                    if not conn.pending_waits and conn.status == "waiting_input":
+                        conn.status = "running"
                 return ev
             return None
 
@@ -2337,6 +2809,8 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
             else None
         )
         proc_alive = verify_process_identity(pid, exp_lstart) if pid else (conn is not None and not conn.closed)
+        if conn is not None and (conn.closed or conn.eof_reached or (conn.proc is not None and conn.proc.poll() is not None)):
+            proc_alive = False
 
         s_dict, _msgs, _reason = self._read_source_session_from_sqlite(handle.runtime_sid)
         db_dir = s_dict.get("directory") if s_dict else None
@@ -2376,7 +2850,15 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         response: WaitResponse | Mapping[str, Any],
         control_id: str,
     ) -> ControlReceipt:
-        conn = self._require_open_connection(handle)
+        try:
+            conn = self._require_open_connection(handle)
+        except SideSessionError as exc:
+            raise SideSessionError(
+                ErrorCode.WAIT_RESPONSE_UNAVAILABLE,
+                exc.message,
+                {"runtime_instance_id": getattr(handle, "runtime_instance_id", None)},
+            ) from exc
+
         if not isinstance(request, BoundWait):
             raise SideSessionError(ErrorCode.INVALID_REQUEST, "request must be a BoundWait")
         if request.runtime_instance_id != handle.runtime_instance_id:
@@ -2395,39 +2877,130 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 f"WaitResponse kind ({val_resp['kind']!r}) does not match BoundWait kind ({request.kind!r})",
             )
 
-        if request.kind == "permission":
-            method = "respond_permission"
-        elif request.kind == "elicitation":
-            method = "respond_elicitation"
-        else:
-            method = "session/respond_input"
+        pending = conn.pending_waits.get(request.host_request_id)
+        if pending is None:
+            raise SideSessionError(
+                ErrorCode.WAIT_STALE,
+                f"No pending reverse interaction request for host_request_id={request.host_request_id}",
+                {"wait_id": request.wait_id, "host_request_id": request.host_request_id},
+            )
+        if pending.get("sentResult") is not None:
+            raise SideSessionError(
+                ErrorCode.WAIT_STALE,
+                f"Reverse interaction request {request.host_request_id} has already been responded to",
+                {"wait_id": request.wait_id, "host_request_id": request.host_request_id},
+            )
+        if (
+            pending.get("runtime_instance_id") not in ("", handle.runtime_instance_id)
+            or pending.get("sessionId") != handle.runtime_sid
+        ):
+            raise SideSessionError(
+                ErrorCode.WAIT_STALE,
+                "Pending wait connection identity mismatch",
+                {
+                    "wait_id": request.wait_id,
+                    "expected_sid": handle.runtime_sid,
+                    "pending_sid": pending.get("sessionId"),
+                },
+            )
 
-        assert conn.proc is not None
-        rpc_params = {
-            "sessionId": handle.runtime_sid,
-            "requestId": request.host_request_id,
-            "nonce": request.nonce,
-            "controlId": str(control_id),
-            "response": val_resp,
-        }
-        resp = self._rpc_call(
-            conn.proc,
-            method,
-            rpc_params,
-            event_sink=conn.event_queue,
-            runtime_sid=handle.runtime_sid,
-        )
-        res_body = resp.get("result") if isinstance(resp.get("result"), Mapping) else resp
-        assert isinstance(res_body, Mapping)
-        conn.status = "running"
+        latest_rpc_id = pending.get("latestRpcId")
+        if latest_rpc_id is None or str(latest_rpc_id).strip() == "":
+            raise SideSessionError(
+                ErrorCode.WAIT_RESPONSE_UNAVAILABLE,
+                "Pending reverse request is missing wire RPC id",
+                {"wait_id": request.wait_id},
+            )
+
+        if conn.proc is None or conn.proc.stdin is None or conn.eof_reached or conn.proc.poll() is not None:
+            raise SideSessionError(
+                ErrorCode.WAIT_RESPONSE_UNAVAILABLE,
+                "app-server connection is closed; cannot deliver wait response",
+                {"wait_id": request.wait_id},
+            )
+
+        wire_result: dict[str, Any]
+        if request.kind == "permission":
+            raw_opts = pending.get("params", {}).get("options") if isinstance(pending.get("params"), Mapping) else []
+            matched_opt: Mapping[str, Any] | None = None
+            req_opt_id = str(val_resp["option_id"])
+            req_dec = str(val_resp["decision"])
+            for opt in (raw_opts or []):
+                if not isinstance(opt, Mapping):
+                    continue
+                oid = str(opt.get("optionId") or opt.get("option_id") or opt.get("id") or "").strip()
+                if oid == req_opt_id:
+                    matched_opt = opt
+                    break
+            if matched_opt is None or not isinstance(matched_opt.get("response"), Mapping):
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Permission option_id {req_opt_id!r} not found in pending reverse request options",
+                    {"wait_id": request.wait_id, "option_id": req_opt_id},
+                )
+            opt_resp = dict(matched_opt["response"])
+            if str(opt_resp.get("decision") or "") != req_dec:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Permission decision {req_dec!r} conflicts with option response decision {opt_resp.get('decision')!r}",
+                    {"wait_id": request.wait_id, "option_id": req_opt_id},
+                )
+            # Strict V4 wire payload: exact options[i].response with zero internal metadata leaked
+            wire_result = opt_resp
+        elif request.kind == "elicitation":
+            wire_result = {"action": str(val_resp["action"])}
+            if val_resp.get("content") is not None:
+                if not isinstance(val_resp["content"], Mapping):
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        "UserInput wire content must be a JSON object",
+                    )
+                wire_result["content"] = dict(val_resp["content"])
+            if val_resp.get("reason") is not None:
+                wire_result["reason"] = str(val_resp["reason"])
+
+            # Enforce plan_approval accept carries valid non-empty option value
+            pending_params = pending.get("params") if isinstance(pending.get("params"), Mapping) else {}
+            schema_obj = pending_params.get("schema") if isinstance(pending_params.get("schema"), Mapping) else {}
+            is_plan = (
+                schema_obj.get("interaction") == "plan_approval"
+                or pending_params.get("toolName") in ("ExitPlanMode", "plan_approval")
+                or pending_params.get("origin") == "plan_approval"
+            )
+            if is_plan and wire_result["action"] == "accept":
+                c_obj = wire_result.get("content")
+                if not isinstance(c_obj, Mapping) or not c_obj:
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        "plan_approval accept requires non-empty content carrying a valid option value",
+                    )
+        else:
+            # request.kind == "input"
+            wire_result = {"action": "accept", "content": {"answer": str(val_resp["text"])}}
+
+        try:
+            self._write_json_line(
+                conn.proc,
+                {"id": latest_rpc_id, "result": wire_result},
+                write_lock=conn.write_lock,
+            )
+        except OSError as exc:
+            raise SideSessionError(
+                ErrorCode.WAIT_RESPONSE_UNAVAILABLE,
+                f"Failed writing wait response to app-server stdin: {exc}",
+                {"wait_id": request.wait_id},
+            ) from exc
+
+        pending["sentResult"] = copy.deepcopy(wire_result)
+        pending["controlId"] = str(control_id)
 
         return ControlReceipt(
             control_id=str(control_id),
-            status=str(res_body.get("status") or "applied"),
+            status="unknown",
             runtime_instance_id=handle.runtime_instance_id,
             owner_epoch=request.owner_epoch,
-            observed_wait_state=str(res_body.get("observed_wait_state") or "resolved"),
-            host_receipt_id=str(res_body.get("receiptId") or f"wait-rcpt:{control_id}"),
+            observed_wait_state="unknown",
+            host_receipt_id=None,
         )
 
     def stop_and_wait(self, handle: RuntimeHandle, deadline_ms: int = 5000) -> ExitReceipt:
@@ -2452,10 +3025,12 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         if proc is None:
             conn.closed = True
             conn.status = "exited"
+            conn.pending_waits.clear()
             with self._lock:
                 self._connections.pop(handle.runtime_instance_id, None)
                 if pid is not None:
                     self._stdout_queues.pop(pid, None)
+                    self._write_locks.pop(pid, None)
             return ExitReceipt(
                 runtime_instance_id=handle.runtime_instance_id,
                 process_identity=dict(handle.process_identity),
@@ -2470,13 +3045,15 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         if proc.poll() is None and verify_process_identity(pid, exp_lstart):
             try:
                 if proc.stdin is not None:
-                    stop_msg = canonical_json({
-                        "id": str(uuid.uuid4()),
-                        "method": "session/stop",
-                        "params": {"sessionId": handle.runtime_sid},
-                    }) + "\n"
-                    proc.stdin.write(stop_msg.encode("utf-8"))
-                    proc.stdin.flush()
+                    self._write_json_line(
+                        proc,
+                        {
+                            "id": str(uuid.uuid4()),
+                            "method": "session/stop",
+                            "params": {"sessionId": handle.runtime_sid},
+                        },
+                        write_lock=conn.write_lock,
+                    )
             except Exception:
                 pass
             try:
@@ -2526,6 +3103,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
         if exit_confirmed:
             conn.closed = True
             conn.status = "exited"
+            conn.pending_waits.clear()
             conn.exit_code = exit_code if exit_code is not None else -signal.SIGTERM
             for pipe in (proc.stdin, proc.stdout, proc.stderr):
                 if pipe is not None:
@@ -2537,6 +3115,7 @@ class ZCodeDriver(_HostSqliteHistoryMixin, BaseDriver):
                 self._connections.pop(handle.runtime_instance_id, None)
                 if pid is not None:
                     self._stdout_queues.pop(pid, None)
+                    self._write_locks.pop(pid, None)
 
         return ExitReceipt(
             runtime_instance_id=handle.runtime_instance_id,

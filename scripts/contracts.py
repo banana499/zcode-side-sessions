@@ -1562,7 +1562,7 @@ def _validate_wait_response(resp: Any) -> dict[str, Any]:
         text = _require_non_empty_str(resp.get("text"), "response.text", max_len=MAX_PROMPT_CHARS)
         return {"kind": "input", "text": text}
     if kind == "elicitation":
-        _reject_unknown_fields(resp, {"kind", "action", "content"}, "WaitResponse(elicitation)")
+        _reject_unknown_fields(resp, {"kind", "action", "content", "reason"}, "WaitResponse(elicitation)")
         action = resp.get("action")
         if action not in ("accept", "decline", "cancel"):
             raise SideSessionError(
@@ -1571,12 +1571,21 @@ def _validate_wait_response(resp: Any) -> dict[str, Any]:
                 {"field": "response.action", "value": action},
             )
         content = resp.get("content")
-        if content is not None and not isinstance(content, (str, Mapping, list)):
+        if content is not None and not isinstance(content, Mapping):
             raise SideSessionError(
                 ErrorCode.INVALID_REQUEST,
-                "elicitation content has invalid type",
+                "elicitation content must be a JSON object",
+                {"field": "response.content", "actual_type": type(content).__name__},
             )
-        return {"kind": "elicitation", "action": action, "content": _normalize_json_value(content)}
+        out_el: dict[str, Any] = {
+            "kind": "elicitation",
+            "action": action,
+            "content": _normalize_json_value(content),
+        }
+        if "reason" in resp and resp.get("reason") is not None:
+            reason_val = _require_non_empty_str(resp.get("reason"), "response.reason", max_len=4096)
+            out_el["reason"] = reason_val
+        return out_el
     if kind == "permission":
         _reject_unknown_fields(resp, {"kind", "option_id", "decision"}, "WaitResponse(permission)")
         option_id = _require_non_empty_str(resp.get("option_id"), "response.option_id", max_len=128)

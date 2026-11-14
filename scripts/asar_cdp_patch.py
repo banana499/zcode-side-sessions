@@ -33,6 +33,8 @@ PAT_PATCHED = re.compile(
 WIRE_IDX_NODE_CLI_INSPECT = 3  # 第 4 位：node_cli_inspect
 WIRE_IDX_ASAR_INTEGRITY = 4  # 第 5 位：embedded_asar_integrity_validation
 DEFAULT_FUSE_WIRE_OFFSET = 157950204
+ELECTRON_FUSE_SENTINEL = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX"
+DEFAULT_ADAPTER_CANDIDATE = "zcode-3.17.2"
 
 
 def sha256_file(p: Path) -> str:
@@ -699,6 +701,639 @@ def resolve_build_entry(
             return None, cur_sha, "ASAR_SLICE_MISMATCH"
 
         return dict(builds_map[orig_sha]), cur_sha, None
+    finally:
+        os.close(fd)
+
+
+def _stat_ident_full(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_size,
+        getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
+        getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)),
+    )
+
+
+def _same_regular_file(path: Path, fd: int, st_before: os.stat_result) -> bool:
+    try:
+        st_after = os.fstat(fd)
+        lst = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode) or not stat.S_ISREG(st_after.st_mode):
+        return False
+    if (lst.st_dev, lst.st_ino) != (st_before.st_dev, st_before.st_ino):
+        return False
+    return _stat_ident_full(st_after) == _stat_ident_full(st_before)
+
+
+class _PreadFileView:
+    """Read-only seekable file view backed by os.pread on an open descriptor."""
+
+    def __init__(self, fd: int, size: int) -> None:
+        self._fd = fd
+        self._size = size
+        self._pos = 0
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self._pos + offset
+        elif whence == os.SEEK_END:
+            target = self._size + offset
+        else:
+            raise ValueError(f"Unsupported whence: {whence}")
+        if target < 0:
+            raise ValueError("Negative seek position")
+        self._pos = target
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        if n == 0 or self._pos >= self._size:
+            return b""
+        to_read = (self._size - self._pos) if n < 0 else min(n, self._size - self._pos)
+        chunks: list[bytes] = []
+        remaining = to_read
+        while remaining > 0:
+            part = os.pread(self._fd, min(remaining, 1 << 20), self._pos)
+            if not part:
+                break
+            chunks.append(part)
+            self._pos += len(part)
+            remaining -= len(part)
+        return b"".join(chunks)
+
+
+def _parse_fuse_wire_at(fd: int, wire_off: int, file_size: int) -> tuple[str | None, int | None, int | None, str | None]:
+    if wire_off < 0 or wire_off + 2 > file_size:
+        return None, None, None, "FUSE_WIRE_INVALID"
+    head = os.pread(fd, 2, wire_off)
+    if len(head) != 2:
+        return None, None, None, "FUSE_WIRE_INVALID"
+    ver, n = head[0], head[1]
+    if ver != 1 or n < 1 or n > 64 or wire_off + 2 + n > file_size:
+        return None, None, None, "FUSE_WIRE_INVALID"
+    raw = os.pread(fd, n, wire_off + 2)
+    if len(raw) != n:
+        return None, None, None, "FUSE_WIRE_INVALID"
+    try:
+        wire = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None, None, None, "FUSE_WIRE_INVALID"
+    if set(wire) - set("01r"):
+        return None, None, None, "FUSE_WIRE_INVALID"
+    return wire, ver, n, None
+
+
+def _resolve_framework_binary(framework_path: Path) -> tuple[Path | None, str | None]:
+    """Resolve standard macOS .framework bundle symlinks while rejecting external symlink escapes."""
+    try:
+        lst = os.lstat(framework_path)
+    except OSError:
+        return None, "FRAMEWORK_NOT_FOUND"
+    if stat.S_ISLNK(lst.st_mode):
+        parent = framework_path.parent
+        if not parent.name.endswith(".framework"):
+            return None, "FRAMEWORK_NOT_REGULAR"
+        try:
+            parent_lst = os.lstat(parent)
+            if stat.S_ISLNK(parent_lst.st_mode) or not stat.S_ISDIR(parent_lst.st_mode):
+                return None, "FRAMEWORK_NOT_REGULAR"
+            bundle_dir = Path(os.path.realpath(parent))
+            resolved = Path(os.path.realpath(framework_path))
+        except OSError:
+            return None, "FRAMEWORK_NOT_FOUND"
+        if resolved == bundle_dir or not resolved.is_relative_to(bundle_dir):
+            return None, "FRAMEWORK_NOT_REGULAR"
+        return resolved, None
+    if not stat.S_ISREG(lst.st_mode):
+        return None, "FRAMEWORK_NOT_REGULAR"
+    return framework_path, None
+
+
+def discover_fuse_wire(
+    framework_path: Path | None = None,
+    *,
+    hint_offset: int | None = None,
+    sentinel: bytes = ELECTRON_FUSE_SENTINEL,
+    cache: dict[str, Any] | None = None,
+    app_gen: str | None = None,
+    max_scan_bytes: int = 512 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Dynamically locate Electron Fuse sentinel + wire in Electron Framework without trusting hardcoded offsets."""
+    empty_res: dict[str, Any] = {
+        "found": False,
+        "offset": None,
+        "wireOffset": None,
+        "wire": None,
+        "nodeCliInspect": False,
+        "asarIntegrityOff": False,
+        "error": None,
+    }
+    if framework_path is None:
+        return {**empty_res, "error": "FRAMEWORK_NOT_FOUND"}
+
+    target_fw, fw_err = _resolve_framework_binary(framework_path)
+    if fw_err or target_fw is None:
+        return {**empty_res, "error": fw_err or "FRAMEWORK_NOT_FOUND"}
+
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(target_fw), os.O_RDONLY | o_nofollow)
+    except OSError:
+        return {**empty_res, "error": "FRAMEWORK_NOT_FOUND"}
+
+    try:
+        st1 = os.fstat(fd)
+        if not stat.S_ISREG(st1.st_mode) or not _same_regular_file(target_fw, fd, st1):
+            return {**empty_res, "error": "FRAMEWORK_NOT_REGULAR"}
+
+        def _fw_unchanged() -> bool:
+            if not _same_regular_file(target_fw, fd, st1):
+                return False
+            if target_fw != framework_path:
+                try:
+                    return Path(os.path.realpath(framework_path)) == target_fw
+                except OSError:
+                    return False
+            return True
+
+        fw_stat_key = _stat_ident_full(st1)
+        if (
+            isinstance(cache, dict)
+            and isinstance(cache.get("fuse"), dict)
+            and cache["fuse"].get("stat_key") == fw_stat_key
+            and cache["fuse"].get("app_gen") == app_gen
+            and isinstance(cache["fuse"].get("result"), dict)
+        ):
+            return dict(cache["fuse"]["result"])
+
+        file_size = st1.st_size
+        s_len = len(sentinel)
+        saw_invalid_wire = False
+
+        def _check_sentinel_at(s_off: int) -> dict[str, Any] | None:
+            nonlocal saw_invalid_wire
+            if s_off < 0 or s_off + s_len + 2 > file_size:
+                return None
+            if os.pread(fd, s_len, s_off) != sentinel:
+                return None
+            wire_off = s_off + s_len
+            wire, _ver, _n, w_err = _parse_fuse_wire_at(fd, wire_off, file_size)
+            if w_err or wire is None:
+                saw_invalid_wire = True
+                return None
+            if not _fw_unchanged():
+                return {**empty_res, "error": "FRAMEWORK_REPLACED"}
+            return {
+                "found": True,
+                "offset": s_off,
+                "wireOffset": wire_off,
+                "wire": wire,
+                "nodeCliInspect": (
+                    len(wire) > WIRE_IDX_NODE_CLI_INSPECT and wire[WIRE_IDX_NODE_CLI_INSPECT] == "1"
+                ),
+                "asarIntegrityOff": (
+                    len(wire) > WIRE_IDX_ASAR_INTEGRITY and wire[WIRE_IDX_ASAR_INTEGRITY] == "0"
+                ),
+                "error": None,
+            }
+
+        # Fast-path hint offsets before scanning
+        candidates: list[int] = []
+        eff_hint = DEFAULT_FUSE_WIRE_OFFSET if hint_offset is None else hint_offset
+        if isinstance(eff_hint, int) and eff_hint >= 0:
+            candidates.append(eff_hint)
+            if eff_hint >= s_len:
+                candidates.append(eff_hint - s_len)
+        for cand in candidates:
+            hit = _check_sentinel_at(cand)
+            if hit is not None:
+                if hit.get("found") and isinstance(cache, dict):
+                    cache["fuse"] = {"stat_key": fw_stat_key, "app_gen": app_gen, "result": dict(hit)}
+                return hit
+
+        # Bounded chunked scan fallback
+        scan_limit = min(file_size, max_scan_bytes)
+        chunk_size = 4 << 20
+        overlap = max(0, s_len - 1)
+        pos = 0
+        while pos < scan_limit:
+            to_read = min(chunk_size, scan_limit - pos)
+            buf = os.pread(fd, to_read, pos)
+            if not buf:
+                break
+            search_from = 0
+            while True:
+                idx = buf.find(sentinel, search_from)
+                if idx < 0:
+                    break
+                hit = _check_sentinel_at(pos + idx)
+                if hit is not None:
+                    if hit.get("found") and isinstance(cache, dict):
+                        cache["fuse"] = {"stat_key": fw_stat_key, "app_gen": app_gen, "result": dict(hit)}
+                    return hit
+                search_from = idx + 1
+            if pos + len(buf) >= scan_limit:
+                break
+            pos += max(1, len(buf) - overlap)
+
+        if not _fw_unchanged():
+            return {**empty_res, "error": "FRAMEWORK_REPLACED"}
+        out = {
+            **empty_res,
+            "error": "FUSE_WIRE_INVALID" if saw_invalid_wire else "FUSE_SENTINEL_NOT_FOUND",
+        }
+        if isinstance(cache, dict):
+            cache["fuse"] = {"stat_key": fw_stat_key, "app_gen": app_gen, "result": dict(out)}
+        return out
+    finally:
+        os.close(fd)
+
+
+def _infer_app_path_from_asar(asar_path: Path) -> Path | None:
+    try:
+        if asar_path.parent.name == "Resources" and asar_path.parent.parent.name == "Contents":
+            return asar_path.parent.parent.parent
+    except Exception:
+        pass
+    return None
+
+
+def _default_adapter_candidate(builds_map: Mapping[str, Any]) -> str:
+    for entry in builds_map.values():
+        if isinstance(entry, Mapping) and isinstance(entry.get("adapter"), str) and entry["adapter"].strip():
+            return str(entry["adapter"]).strip()
+    return DEFAULT_ADAPTER_CANDIDATE
+
+
+def _read_manifest_readonly(manifest_path: Path | None) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Pure read-only manifest inspection. Never writes or migrates files.
+
+    Returns (manifest_dict_or_None, error_code_or_None, file_exists).
+    """
+    if manifest_path is None:
+        return None, None, False
+    try:
+        lst = os.lstat(manifest_path)
+    except OSError:
+        return None, None, False
+    if stat.S_ISLNK(lst.st_mode):
+        return None, "MANIFEST_UNTRUSTED", True
+
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        m_fd = os.open(str(manifest_path), os.O_RDONLY | o_nofollow)
+    except OSError:
+        return None, "MANIFEST_UNREADABLE", True
+    try:
+        m_st = os.fstat(m_fd)
+        if (
+            not stat.S_ISREG(m_st.st_mode)
+            or m_st.st_uid != os.getuid()
+            or (m_st.st_mode & 0o022) != 0
+        ):
+            return None, "MANIFEST_UNTRUSTED", True
+        if m_st.st_size > 1024 * 1024:
+            return None, "MANIFEST_TOO_LARGE", True
+        raw = bytearray()
+        off = 0
+        while True:
+            part = os.pread(m_fd, 65536, off)
+            if not part:
+                break
+            raw.extend(part)
+            off += len(part)
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            return None, "MANIFEST_INVALID", True
+        return parsed, None, True
+    except Exception:
+        return None, "MANIFEST_INVALID", True
+    finally:
+        os.close(m_fd)
+
+
+def _verify_official_bundle(
+    app_path: Path | None,
+    asar_sha: str,
+    cache: dict[str, Any] | None,
+    *,
+    stat_key: tuple[int, int, int, int, int],
+    app_gen: str | None,
+) -> dict[str, Any]:
+    if (
+        isinstance(cache, dict)
+        and isinstance(cache.get("signature"), dict)
+        and cache["signature"].get("stat_key") == stat_key
+        and cache["signature"].get("app_gen") == app_gen
+        and isinstance(cache["signature"].get("result"), dict)
+    ):
+        return dict(cache["signature"]["result"])
+
+    if app_path is None:
+        res = {"checked": False, "valid": False, "error": "APP_BUNDLE_NOT_FOUND"}
+        if isinstance(cache, dict):
+            cache["signature"] = {"stat_key": stat_key, "app_gen": app_gen, "result": dict(res)}
+        return res
+
+    info_plist = app_path / "Contents" / "Info.plist"
+    if info_plist.is_file() and not info_plist.is_symlink():
+        try:
+            pl = plistlib.loads(info_plist.read_bytes())
+            bid = pl.get("CFBundleIdentifier")
+            if isinstance(bid, str) and bid.strip() and bid.strip() != "dev.zcode.app":
+                res = {"checked": True, "valid": False, "error": "BUNDLE_ID_MISMATCH"}
+                if isinstance(cache, dict):
+                    cache["signature"] = {"stat_key": stat_key, "app_gen": app_gen, "result": dict(res)}
+                return res
+        except Exception:
+            res = {"checked": True, "valid": False, "error": "INFO_PLIST_INVALID"}
+            if isinstance(cache, dict):
+                cache["signature"] = {"stat_key": stat_key, "app_gen": app_gen, "result": dict(res)}
+            return res
+
+    hash2 = read_coderesources_hash2(app_path)
+    if hash2 is not None and hash2.lower() != asar_sha.lower():
+        res = {"checked": True, "valid": False, "error": "CODERESOURCES_HASH_MISMATCH"}
+        if isinstance(cache, dict):
+            cache["signature"] = {"stat_key": stat_key, "app_gen": app_gen, "result": dict(res)}
+        return res
+
+    cs_valid = codesign_ok(app_path)
+    res = {
+        "checked": True,
+        "valid": bool(cs_valid),
+        "error": None if cs_valid else "CODESIGN_INVALID",
+    }
+    if isinstance(cache, dict):
+        cache["signature"] = {"stat_key": stat_key, "app_gen": app_gen, "result": dict(res)}
+    return res
+
+
+def probe_runtime_build(
+    asar_path: Path,
+    manifest_path: Path | None,
+    builds: Mapping[str, Any],
+    cache: dict[str, Any] | None = None,
+    *,
+    framework_path: Path | None = None,
+    app_gen: str | None = None,
+) -> dict[str, Any]:
+    """Pure read-only runtime build, patch provenance, signature, and Fuse probe.
+
+    NEVER calls migrate_legacy_manifest_if_verified and NEVER writes any files.
+    """
+    target_asar = asar_path or ASAR
+    builds_map = builds if isinstance(builds, Mapping) else {}
+    empty_fuse = {
+        "found": False,
+        "offset": None,
+        "wireOffset": None,
+        "wire": None,
+        "nodeCliInspect": False,
+        "asarIntegrityOff": False,
+        "error": "FRAMEWORK_NOT_CHECKED",
+    }
+    empty_sig = {"checked": False, "valid": False, "error": None}
+
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(target_asar), os.O_RDONLY | o_nofollow)
+    except OSError:
+        return {
+            "ok": False,
+            "asarSha": "",
+            "buildState": "rejected",
+            "patchState": "absent",
+            "adapterCandidate": None,
+            "fuse": empty_fuse,
+            "signature": empty_sig,
+            "diagnostics": {"codes": ["ASAR_NOT_FOUND"]},
+        }
+
+    try:
+        st1 = os.fstat(fd)
+        if not stat.S_ISREG(st1.st_mode) or not _same_regular_file(target_asar, fd, st1):
+            return {
+                "ok": False,
+                "asarSha": "",
+                "buildState": "rejected",
+                "patchState": "absent",
+                "adapterCandidate": None,
+                "fuse": empty_fuse,
+                "signature": empty_sig,
+                "diagnostics": {"codes": ["ASAR_NOT_REGULAR"]},
+            }
+
+        stat_key = _stat_ident_full(st1)
+        cached_asar = (
+            cache.get("asar")
+            if isinstance(cache, dict) and isinstance(cache.get("asar"), dict)
+            else None
+        )
+        if (
+            cached_asar is not None
+            and cached_asar.get("stat_key") == stat_key
+            and cached_asar.get("app_gen") == app_gen
+            and isinstance(cached_asar.get("sha"), str)
+            and cached_asar["sha"]
+            and isinstance(cached_asar.get("loc"), dict)
+        ):
+            cur_sha = str(cached_asar["sha"])
+            loc = dict(cached_asar["loc"])
+        else:
+            h = hashlib.sha256()
+            off = 0
+            while True:
+                chunk = os.pread(fd, 1 << 20, off)
+                if not chunk:
+                    break
+                h.update(chunk)
+                off += len(chunk)
+            if not _same_regular_file(target_asar, fd, st1):
+                return {
+                    "ok": False,
+                    "asarSha": "",
+                    "buildState": "rejected",
+                    "patchState": "absent",
+                    "adapterCandidate": None,
+                    "fuse": empty_fuse,
+                    "signature": empty_sig,
+                    "diagnostics": {"codes": ["ASAR_REPLACED"]},
+                }
+            cur_sha = h.hexdigest()
+            try:
+                loc = _locate_in_stream(_PreadFileView(fd, st1.st_size))
+            except Exception:
+                loc = {"ok": False, "code": "INVALID_ASAR_STRUCTURE"}
+            if not _same_regular_file(target_asar, fd, st1):
+                return {
+                    "ok": False,
+                    "asarSha": "",
+                    "buildState": "rejected",
+                    "patchState": "absent",
+                    "adapterCandidate": None,
+                    "fuse": empty_fuse,
+                    "signature": empty_sig,
+                    "diagnostics": {"codes": ["ASAR_REPLACED"]},
+                }
+            if isinstance(cache, dict):
+                cache["asar"] = {
+                    "stat_key": stat_key,
+                    "app_gen": app_gen,
+                    "sha": cur_sha,
+                    "loc": {k: v for k, v in loc.items() if k not in ("orig", "new")},
+                }
+
+        manifest, manifest_err, manifest_exists = _read_manifest_readonly(manifest_path)
+        diag_codes: list[str] = []
+        if manifest_err:
+            diag_codes.append(manifest_err)
+
+        known_entry: dict[str, Any] | None = None
+        build_state = "rejected"
+        patch_state = "absent"
+        adapter_candidate: str | None = None
+        sig_info: dict[str, Any] = {"checked": False, "valid": False, "error": None}
+        app_path = _infer_app_path_from_asar(target_asar)
+
+        if cur_sha in builds_map and isinstance(builds_map[cur_sha], Mapping):
+            known_entry = dict(builds_map[cur_sha])
+            build_state = "known"
+            adapter_candidate = str(known_entry.get("adapter") or _default_adapter_candidate(builds_map))
+            if manifest_exists:
+                patch_state = "stale"
+                diag_codes.append("LEGACY_OR_STALE_MANIFEST")
+            else:
+                patch_state = "absent"
+            diag_codes.append("KNOWN_BUILD")
+        else:
+            # Check if cur_sha is a verified patched build against a known origSha
+            verified_patched = False
+            if (
+                manifest is not None
+                and manifest.get("patchedSha") == cur_sha
+                and isinstance(manifest.get("origSha"), str)
+                and manifest["origSha"] in builds_map
+                and loc.get("alreadyPatched") is True
+                and isinstance(manifest.get("abs"), int)
+                and not isinstance(manifest.get("abs"), bool)
+                and manifest.get("abs") == loc.get("patchedAbs")
+                and isinstance(manifest.get("patched"), str)
+                and isinstance(manifest.get("patchLen"), int)
+                and not isinstance(manifest.get("patchLen"), bool)
+            ):
+                try:
+                    exp_bytes = manifest["patched"].encode("latin-1")
+                    p_len = int(manifest["patchLen"])
+                    p_abs = int(manifest["abs"])
+                    if p_len > 0 and p_len == len(exp_bytes) and p_abs >= 0:
+                        actual_slice = os.pread(fd, p_len, p_abs)
+                        if not _same_regular_file(target_asar, fd, st1):
+                            return {
+                                "ok": False,
+                                "asarSha": "",
+                                "buildState": "rejected",
+                                "patchState": "conflict",
+                                "adapterCandidate": None,
+                                "fuse": empty_fuse,
+                                "signature": empty_sig,
+                                "diagnostics": {"codes": ["ASAR_REPLACED"]},
+                            }
+                        exp_slice_sha = manifest.get("patchedSliceSha")
+                        if actual_slice == exp_bytes and (
+                            not exp_slice_sha
+                            or hashlib.sha256(actual_slice).hexdigest() == exp_slice_sha
+                        ):
+                            verified_patched = True
+                except Exception:
+                    verified_patched = False
+
+            if verified_patched and manifest is not None:
+                known_entry = dict(builds_map[str(manifest["origSha"])])
+                build_state = "known"
+                patch_state = "current"
+                adapter_candidate = str(
+                    known_entry.get("adapter") or _default_adapter_candidate(builds_map)
+                )
+                diag_codes.append("VERIFIED_PATCHED_BUILD")
+            elif (
+                loc.get("alreadyPatched") is True
+                or loc.get("fileShaOk") is False
+                or loc.get("code") == "INVALID_ASAR_STRUCTURE"
+            ):
+                build_state = "rejected"
+                patch_state = "conflict"
+                adapter_candidate = None
+                diag_codes.append("UNKNOWN_MODIFIED_BUNDLE")
+                if loc.get("alreadyPatched"):
+                    diag_codes.append("UNVERIFIED_CDP_PATCH_BYTES")
+                if loc.get("fileShaOk") is False:
+                    diag_codes.append("INDEXJS_INTEGRITY_MISMATCH")
+            else:
+                patch_state = "stale" if manifest_exists else "absent"
+                if manifest_exists:
+                    diag_codes.append("STALE_MANIFEST")
+                sig_info = _verify_official_bundle(
+                    app_path,
+                    cur_sha,
+                    cache,
+                    stat_key=stat_key,
+                    app_gen=app_gen,
+                )
+                if sig_info.get("valid"):
+                    build_state = "probation"
+                    adapter_candidate = _default_adapter_candidate(builds_map)
+                    diag_codes.append("PROBATION_OFFICIAL_BUNDLE")
+                else:
+                    build_state = "rejected"
+                    adapter_candidate = None
+                    diag_codes.append(str(sig_info.get("error") or "SIGNATURE_INVALID"))
+
+        fw_path = framework_path
+        if fw_path is None:
+            if app_path is not None:
+                fw_path = (
+                    app_path
+                    / "Contents"
+                    / "Frameworks"
+                    / "Electron Framework.framework"
+                    / "Electron Framework"
+                )
+            elif target_asar == ASAR:
+                fw_path = FRAMEWORK
+
+        hint_off = (known_entry or {}).get("fuseWireOffset", DEFAULT_FUSE_WIRE_OFFSET)
+        fuse_info = discover_fuse_wire(
+            fw_path,
+            hint_offset=hint_off,
+            cache=cache,
+            app_gen=app_gen,
+        )
+        if not fuse_info.get("found"):
+            diag_codes.append(str(fuse_info.get("error") or "FUSE_NOT_FOUND"))
+
+        return {
+            "ok": build_state in ("known", "probation"),
+            "asarSha": cur_sha,
+            "buildState": build_state,
+            "patchState": patch_state,
+            "adapterCandidate": adapter_candidate,
+            "fuse": fuse_info,
+            "signature": sig_info,
+            "diagnostics": {
+                "codes": diag_codes,
+                "manifestExists": manifest_exists,
+                "manifestOrigSha": manifest.get("origSha") if manifest else None,
+                "manifestPatchedSha": manifest.get("patchedSha") if manifest else None,
+                "alreadyPatched": bool(loc.get("alreadyPatched")),
+                "fileShaOk": loc.get("fileShaOk"),
+                "appGen": app_gen,
+            },
+        }
     finally:
         os.close(fd)
 

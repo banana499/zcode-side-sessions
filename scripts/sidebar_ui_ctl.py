@@ -30,6 +30,7 @@ from zcode_proc import (  # noqa: E402
     AppGen,
     cdp_http_get_json,
     current_app,
+    proc_path,
     resolve_devtools_port_file,
     verify_endpoint,
 )
@@ -246,18 +247,344 @@ def probe_l0_existing_cdp(gen: AppGen | None = None) -> dict[str, Any]:
     return {"level": "L0", **ep}
 
 
+def _detect_inspector_listeners(port: int = 9229) -> list[tuple[int, str]]:
+    """Return [(pid, listen_addr), ...] for TCP LISTEN sockets on `port`."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    listeners: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        m = re.match(r"^\S+\s+(\d+)\s+.*\bTCP\s+(\S+):(\d+)\s+\(LISTEN\)", line)
+        if not m:
+            continue
+        if int(m.group(3)) != int(port):
+            continue
+        listeners.append((int(m.group(1)), m.group(2)))
+    return listeners
+
+
+def _wait_for_inspector_loopback(pid: int, port: int, timeout_sec: float = 2.0) -> list[str]:
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        listeners = _detect_inspector_listeners(port)
+        addrs = [addr for lpid, addr in listeners if lpid == pid]
+        if addrs:
+            return addrs
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(0.1)
+
+
+def _wait_for_inspector_closed(pid: int, port: int, timeout_sec: float = 1.5) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        listeners = _detect_inspector_listeners(port)
+        own_addrs = [addr for lpid, addr in listeners if lpid == pid]
+        if not own_addrs:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def ensure_sigusr1_bridge(
+    gen: AppGen,
+    bridge_source: str,
+    bundle_source: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """L1: Bootstrap or reuse the persistent main-process bridge via Node inspector.
+
+    - Re-verifies PID, AppGen start time, host executable identity, and dynamic Fuse `node_cli_inspect`.
+    - Detects whether a debugger is ALREADY listening on inspectorPort before sending SIGUSR1.
+      Existing debuggers are NEVER closed by this function.
+    - Wraps all post-signal steps in `try ... finally`, closes ONLY an inspector opened by us using
+      the resolved `process.getBuiltinModule('inspector')` reference, and verifies the loopback port
+      is closed before ever allowing ok=True / READY.
+    """
+    cfg = dict(config or {})
+    if not _pid_alive(gen.pid):
+        return {"ok": False, "level": "L1", "code": "PID_NOT_ALIVE"}
+
+    expected_exe = str(cfg.get("expectedExe") or APP_EXE)
+    if cfg.get("verifyHostIdentity", True):
+        actual_exe = proc_path(gen.pid)
+        if actual_exe != expected_exe:
+            return {
+                "ok": False,
+                "level": "L1",
+                "code": "HOST_IDENTITY_MISMATCH",
+                "expectedExe": expected_exe,
+                "actualExe": actual_exe,
+            }
+
+    if cfg.get("verifyCurrentApp", True):
+        cur_gen = current_app(expected_exe)
+        if cur_gen is None or cur_gen.pid != gen.pid or abs(cur_gen.lstart - gen.lstart) > 2.0:
+            return {"ok": False, "level": "L1", "code": "APP_GEN_MISMATCH"}
+
+    probe_res = cfg.get("probeResult")
+    if probe_res is None:
+        asar_p = Path(cfg["asarPath"]) if cfg.get("asarPath") else ASAR
+        manifest_p = Path(cfg["manifestPath"]) if cfg.get("manifestPath") else None
+        fw_p = Path(cfg["frameworkPath"]) if cfg.get("frameworkPath") else None
+        builds = cfg.get("builds") if isinstance(cfg.get("builds"), Mapping) else {}
+        probe_res = asar_cdp_patch.probe_runtime_build(
+            asar_p,
+            manifest_p,
+            builds,
+            cache=cfg.get("probeCache") if isinstance(cfg.get("probeCache"), dict) else None,
+            framework_path=fw_p,
+            app_gen=gen.key,
+        )
+
+    if not probe_res.get("ok") or probe_res.get("buildState") == "rejected":
+        return {"ok": False, "level": "L1", "code": "BUILD_REJECTED", "probe": probe_res}
+
+    fuse = probe_res.get("fuse") or {}
+    if not fuse.get("found"):
+        return {
+            "ok": False,
+            "level": "L1",
+            "code": str(fuse.get("error") or "FUSE_UNKNOWN_LAYOUT"),
+            "probe": probe_res,
+        }
+    if not fuse.get("nodeCliInspect"):
+        return {"ok": False, "level": "L1", "code": "NODE_CLI_INSPECT_FUSE_OFF", "probe": probe_res}
+
+    state_root = str(cfg.get("stateRoot") or "").strip()
+    if not state_root:
+        return {"ok": False, "level": "L1", "code": "MISSING_STATE_ROOT", "probe": probe_res}
+
+    port = int(cfg.get("inspectorPort") or 9229)
+    listeners_before = _detect_inspector_listeners(port)
+    other_listeners = [(lpid, addr) for lpid, addr in listeners_before if lpid != gen.pid]
+    own_addrs_before = [addr for lpid, addr in listeners_before if lpid == gen.pid]
+    if other_listeners and not own_addrs_before:
+        return {
+            "ok": False,
+            "level": "L1",
+            "code": "INSPECTOR_PORT_OCCUPIED",
+            "listeners": other_listeners,
+            "probe": probe_res,
+        }
+
+    if own_addrs_before:
+        if any(a != "127.0.0.1" for a in own_addrs_before):
+            return {
+                "ok": False,
+                "level": "L1",
+                "code": "EXISTING_DEBUGGER_NOT_LOOPBACK",
+                "addrs": own_addrs_before,
+                "probe": probe_res,
+            }
+        opened_by_us = False
+    else:
+        opened_by_us = True
+        try:
+            os.kill(gen.pid, signal.SIGUSR1)
+        except OSError as e:
+            return {"ok": False, "level": "L1", "code": "KILL_USR1_FAILED", "detail": str(e), "probe": probe_res}
+
+    ws: CdpSocket | None = None
+    bridge_res: dict[str, Any] = {}
+    bridge_ok = False
+    bridge_err: str | None = None
+    cleanup_ok = True
+    cleanup_err: str | None = None
+    inspector_closed = False
+
+    bundle_sha = hashlib.sha256(bundle_source.encode("utf-8")).hexdigest()
+    bridge_sha = hashlib.sha256(bridge_source.encode("utf-8")).hexdigest()
+    combined_sha = hashlib.sha256((bridge_source + "\n" + bundle_source).encode("utf-8")).hexdigest()
+    adapter_id = str(cfg.get("adapterId") or probe_res.get("adapterCandidate") or "zcode-3.17.2")
+    contract_id = str(cfg.get("contractId") or "sidebar-list-v1")
+
+    try:
+        if opened_by_us:
+            addrs = _wait_for_inspector_loopback(gen.pid, port, timeout_sec=float(cfg.get("signalWaitSec", 2.0)))
+            if not addrs or any(a != "127.0.0.1" for a in addrs):
+                bridge_err = "INSPECTOR_NOT_LISTENING_LOOPBACK"
+                raise RuntimeError(f"addrs={addrs!r}")
+
+        targets = cdp_http_get_json(port, "/json/list", timeout=3.0)
+        node_targets = [t for t in (targets if isinstance(targets, list) else []) if t.get("type") == "node"]
+        if not node_targets:
+            bridge_err = "NO_NODE_TARGET"
+            raise RuntimeError("No node target on inspector")
+        ws_url = str(node_targets[0].get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            bridge_err = "NO_NODE_WS_URL"
+            raise RuntimeError("Missing webSocketDebuggerUrl")
+        ws = CdpSocket(ws_url, timeout=5.0)
+        ws.call("Runtime.enable")
+
+        if opened_by_us:
+            ws.call(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "(() => { "
+                        "const insp = (typeof process !== 'undefined' && typeof process.getBuiltinModule === 'function') "
+                        "? process.getBuiltinModule('inspector') : null; "
+                        "globalThis.__SS_BOOT_INSPECTOR__ = insp; "
+                        "return Boolean(insp && typeof insp.close === 'function'); "
+                        "})()"
+                    ),
+                    "returnByValue": True,
+                },
+            )
+
+        bridge_cfg: dict[str, Any] = {
+            "appGen": gen.key,
+            "stateRoot": state_root,
+            "bundleSource": bundle_source,
+            "bundleSha": bundle_sha,
+            "bridgeSourceSha": bridge_sha,
+            "sourceSha": combined_sha,
+            "adapterId": adapter_id,
+            "contractId": contract_id,
+            "pollIntervalMs": int(cfg.get("pollIntervalMs") or 1500),
+        }
+        if cfg.get("mainUrlPrefix"):
+            bridge_cfg["mainUrlPrefix"] = str(cfg["mainUrlPrefix"])
+
+        eval_expr = (
+            "(async () => {"
+            f"  globalThis.__SS_BRIDGE_CONFIG__ = {json.dumps(bridge_cfg)};"
+            "  try {"
+            f"    const modOrPromise = (0, eval)({json.dumps(bridge_source)});"
+            "    const res = await Promise.resolve(modOrPromise);"
+            "    return res && typeof res === 'object' ? res : { ok: false, code: 'EMPTY_BRIDGE_RESULT' };"
+            "  } finally {"
+            "    try { delete globalThis.__SS_BRIDGE_CONFIG__; } catch (_) {}"
+            "  }"
+            "})()"
+        )
+        res = ws.call(
+            "Runtime.evaluate",
+            {"expression": eval_expr, "awaitPromise": True, "returnByValue": True},
+        )
+        if isinstance(res, dict) and "exceptionDetails" in res:
+            bridge_err = "BRIDGE_EVAL_EXCEPTION"
+            bridge_res = {"ok": False, "code": bridge_err, "exception": res["exceptionDetails"]}
+        else:
+            val = res.get("result", {}).get("value") if isinstance(res, dict) else None
+            bridge_res = val if isinstance(val, dict) else {"ok": False, "code": "BAD_BRIDGE_VALUE"}
+            bridge_ok = bool(bridge_res.get("ok"))
+            if not bridge_ok:
+                bridge_err = str(bridge_res.get("code") or "BRIDGE_INSTALL_FAILED")
+    except (CdpError, OSError, RuntimeError, ValueError) as e:
+        if not bridge_err:
+            bridge_err = "INSPECTOR_RPC_FAILED"
+        bridge_res = {"ok": False, "code": bridge_err, "detail": str(e)}
+    finally:
+        if opened_by_us:
+            close_res_ok = False
+            close_socket_dropped = False
+            close_ws = ws
+            opened_cleanup_ws = False
+            try:
+                if close_ws is None:
+                    try:
+                        t_list = cdp_http_get_json(port, "/json/list", timeout=2.0)
+                        n_t = [t for t in (t_list if isinstance(t_list, list) else []) if t.get("type") == "node"]
+                        if n_t and n_t[0].get("webSocketDebuggerUrl"):
+                            close_ws = CdpSocket(str(n_t[0]["webSocketDebuggerUrl"]), timeout=3.0)
+                            opened_cleanup_ws = True
+                            close_ws.call("Runtime.enable")
+                    except Exception:
+                        close_ws = None
+                if close_ws is not None:
+                    try:
+                        c_eval = close_ws.call(
+                            "Runtime.evaluate",
+                            {
+                                "expression": (
+                                    "(() => { "
+                                    "const insp = globalThis.__SS_BOOT_INSPECTOR__ || "
+                                    "((typeof process !== 'undefined' && typeof process.getBuiltinModule === 'function') "
+                                    "? process.getBuiltinModule('inspector') : null); "
+                                    "try { delete globalThis.__SS_BOOT_INSPECTOR__; } catch (_) {} "
+                                    "if (!insp || typeof insp.close !== 'function') return { closed: false, error: 'INSPECTOR_API_MISSING' }; "
+                                    "insp.close(); "
+                                    "return { closed: true }; "
+                                    "})()"
+                                ),
+                                "returnByValue": True,
+                            },
+                        )
+                        c_val = c_eval.get("result", {}).get("value") if isinstance(c_eval, dict) else None
+                        close_res_ok = bool(isinstance(c_val, dict) and c_val.get("closed"))
+                    except (CdpError, OSError):
+                        # Real Node inspector.close() synchronously tears down the WebSocket server
+                        # before sending the Runtime.evaluate response frame.
+                        close_socket_dropped = True
+            except Exception:
+                close_res_ok = False
+            finally:
+                if close_ws is not None:
+                    try:
+                        close_ws.close()
+                    except Exception:
+                        pass
+                if opened_cleanup_ws:
+                    ws = None
+
+            port_closed = _wait_for_inspector_closed(
+                gen.pid,
+                port,
+                timeout_sec=float(cfg.get("closeWaitSec", 1.5)),
+            )
+            if not close_res_ok and close_socket_dropped and port_closed:
+                close_res_ok = True
+            inspector_closed = bool(close_res_ok and port_closed)
+            if not inspector_closed:
+                cleanup_ok = False
+                cleanup_err = "INSPECTOR_CLOSE_FAILED" if not close_res_ok else "INSPECTOR_PORT_STILL_OPEN"
+        else:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            inspector_closed = False
+
+    ok = bool(bridge_ok and cleanup_ok)
+    out: dict[str, Any] = {
+        "ok": ok,
+        "level": "L1",
+        "appGen": gen.key,
+        "sourceSha": combined_sha,
+        "bundleSha": bundle_sha,
+        "bootNonce": bridge_res.get("bootNonce"),
+        "reused": bool(bridge_res.get("reused")),
+        "openedByUs": opened_by_us,
+        "inspectorClosed": inspector_closed if opened_by_us else None,
+        "existingDebuggerPreserved": not opened_by_us,
+        "bridge": bridge_res,
+        "probe": probe_res,
+    }
+    if not cleanup_ok:
+        out["code"] = cleanup_err
+    elif not bridge_ok:
+        out["code"] = bridge_err or "BRIDGE_INSTALL_FAILED"
+    return out
+
+
 def try_sigusr1_inject(
     gen: AppGen,
     entry: dict[str, Any],
     bundle_source: str,
     snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """L1: Node inspector injection via SIGUSR1.
-
-    Strictly gated on `entry.get('sigusr1Inspector') == 'ok'` in compatibility.json
-    AND Electron Fuse bit 3 (`node_cli_inspect`) == '1'. Never signals unknown builds.
-    Always closes the inspector on port 9229 in `finally`.
-    """
+    """Legacy one-shot SIGUSR1 inspector injection (kept for compatibility; prefer ensure_sigusr1_bridge)."""
     if entry.get("sigusr1Inspector") != "ok":
         return {"ok": False, "level": "L1", "code": "SIGUSR1_NOT_APPROVED_FOR_BUILD"}
     wire, fuse_err = asar_cdp_patch.read_fuse_wire(entry)
@@ -295,7 +622,8 @@ def try_sigusr1_inject(
         snap_lit = json.dumps(json.dumps(snapshot, ensure_ascii=True)) if snapshot else "null"
         expr = (
             "(async () => {"
-            "  const { webContents } = require('electron');"
+            "  const m = process.getBuiltinModule('module');"
+            "  const { webContents } = m.createRequire(process.resourcesPath + '/app.asar/package.json')('electron');"
             "  const targets = webContents.getAllWebContents().filter(w => "
             "    w.getURL().startsWith('file:///Applications/ZCode.app/Contents/Resources/app.asar/out/renderer/index.html'));"
             f" const src = {js_src_lit};"
@@ -328,7 +656,7 @@ def try_sigusr1_inject(
         )
         res = ws.call(
             "Runtime.evaluate",
-            {"expression": expr, "includeCommandLineAPI": True, "awaitPromise": True, "returnByValue": True},
+            {"expression": expr, "awaitPromise": True, "returnByValue": True},
         )
         val = res.get("result", {}).get("value") or {}
         return {"ok": bool(val.get("injectedCount", 0) > 0), "level": "L1", **val}
@@ -340,8 +668,7 @@ def try_sigusr1_inject(
                 ws.call(
                     "Runtime.evaluate",
                     {
-                        "expression": "try { require('inspector').close(); } catch (_) {}",
-                        "includeCommandLineAPI": True,
+                        "expression": "try { process.getBuiltinModule('inspector').close(); } catch (_) {}",
                         "returnByValue": True,
                     },
                 )
@@ -762,15 +1089,24 @@ def install(
     compat = json.loads(compat_path.read_text(encoding="utf-8")) if compat_path.is_file() else {"builds": {}}
     builds_map = compat.get("builds", {}) if isinstance(compat.get("builds"), dict) else {}
     manifest_path = root / "sidebar-ui" / "backups" / "asar_patch.json"
-    build_entry, asar_sha, build_err = asar_cdp_patch.resolve_build_entry(
+    probe_res = asar_cdp_patch.probe_runtime_build(
         ASAR,
         manifest_path,
         builds_map,
     )
-    build_status = build_entry.get("status", "supported") if build_entry else "experimental"
+    build_status = (
+        "supported"
+        if probe_res.get("buildState") == "known"
+        else ("probation" if probe_res.get("buildState") == "probation" else "rejected")
+    )
 
     patch_res = None
     if enable_cdp_patch:
+        build_entry, asar_sha, build_err = asar_cdp_patch.resolve_build_entry(
+            ASAR,
+            manifest_path,
+            builds_map,
+        )
         if build_entry is None:
             patch_res = {
                 "ok": False,
@@ -860,15 +1196,26 @@ def doctor(state_root: Path) -> dict[str, Any]:
             pass
     manifest_p = ui_dir / "backups" / "asar_patch.json"
     patch_st = asar_cdp_patch.status(manifest_p)
-    build_entry, asar_sha, build_err = asar_cdp_patch.resolve_build_entry(
+    gen = current_app()
+    probe_res = asar_cdp_patch.probe_runtime_build(
         ASAR,
         manifest_p,
         compat.get("builds", {}),
+        app_gen=gen.key if gen else None,
     )
-    codesign_state = patch_st.get("codesign", "invalid")
+    asar_sha = str(probe_res.get("asarSha") or "")
+    build_state = str(probe_res.get("buildState") or "rejected")
+    patch_state = str(probe_res.get("patchState") or "absent")
+    fuse_info = probe_res.get("fuse") or {}
+    diag_codes = (probe_res.get("diagnostics") or {}).get("codes") or []
+    build_err = None if probe_res.get("ok") else (diag_codes[0] if diag_codes else "BUILD_REJECTED")
+    codesign_state = (
+        "valid"
+        if (probe_res.get("signature") or {}).get("valid") or patch_st.get("codesign") == "valid"
+        else ("invalid(patched)" if patch_st.get("locate", {}).get("alreadyPatched") else "invalid")
+    )
 
     pf, _ = resolve_devtools_port_file()
-    gen = current_app()
     if gen is not None:
         ep = verify_endpoint(gen)
         if ep.get("ok"):
@@ -971,28 +1318,33 @@ def doctor(state_root: Path) -> dict[str, Any]:
         "app": {
             "version": app_ver,
             "asarSha": asar_sha,
-            "supported": bool(build_entry),
+            "supported": bool(probe_res.get("ok")),
+            "buildState": build_state,
+            "patchState": patch_state,
+            "adapterCandidate": probe_res.get("adapterCandidate"),
+            "fuse": fuse_info,
             "codesign": codesign_state,
             "buildCheckError": build_err,
-            **(
-                {"remediation": "PATCH_MANIFEST_INCOMPLETE: re-run sidebar_ui_ctl.py install"}
-                if build_err == "PATCH_MANIFEST_INCOMPLETE"
-                else {}
-            ),
         },
         "launch": {
             "portFile": str(pf) if pf else None,
             "endpoint": ep_state,
-            "sigusr1Inspector": (build_entry or {}).get("sigusr1Inspector", "untested"),
+            "sigusr1Inspector": "ok" if fuse_info.get("nodeCliInspect") else "unavailable",
             "launchGuard": lg_info,
-            "cdpPatch": (
-                "PATCH_MANIFEST_INCOMPLETE"
-                if build_err == "PATCH_MANIFEST_INCOMPLETE"
-                else patch_st.get("state", "absent")
-            ),
+            "cdpPatch": patch_st.get("state", "absent"),
+            "patchState": patch_state,
         },
         "injector": {
             "state": health.get("state", "WAITING_FOR_APP"),
+            "appGen": health.get("appGen"),
+            "sourceSha": health.get("sourceSha"),
+            "contractId": health.get("contractId"),
+            "transport": health.get("transport"),
+            "capabilities": health.get("capabilities"),
+            "degradationReasons": health.get("degradationReasons"),
+            "snapshot": health.get("snapshot"),
+            "pendingActions": health.get("pendingActions"),
+            "lastHandshakeAt": health.get("lastHandshakeAt"),
             "targets": len(targets_map),
             "sidebarFound": bool(first_target.get("sidebarFound", False)),
             "navigatorResolved": bool(first_target.get("navigatorResolved", False)),

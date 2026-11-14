@@ -9,6 +9,7 @@ from enum import Enum
 import hashlib
 import html
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -76,6 +77,7 @@ try:
         TaskResult,
         WorkspaceSpec,
         WorktreeRecord,
+        _validate_wait_response,
         canonical_json,
         canonical_json_bytes,
         canonical_json_sha256,
@@ -150,6 +152,7 @@ except ImportError:  # pragma: no cover
         TaskResult,
         WorkspaceSpec,
         WorktreeRecord,
+        _validate_wait_response,
         canonical_json,
         canonical_json_bytes,
         canonical_json_sha256,
@@ -175,6 +178,681 @@ if not hasattr(CallerContext, "runtime_session_id"):
 
 MAX_PROPOSALS_PER_PARENT = 20
 MAX_PROPOSALS_PER_TURN = 4
+
+NATIVE_BLOCKED_CREATE_TOOLS: frozenset[str] = frozenset({"CreateSession", "ForkSession"})
+NATIVE_TARGET_GUARDED_TOOLS: frozenset[str] = frozenset({
+    "SendToSession",
+    "InterruptSession",
+    "SetSessionArchived",
+    "RenameSession",
+})
+NATIVE_ALLOWED_READ_NAV_TOOLS: frozenset[str] = frozenset({
+    "ListProjects",
+    "ListSessions",
+    "ReadSession",
+    "OpenSession",
+    "SetSessionPinned",
+    "WaitSessions",
+})
+NATIVE_SESSION_TOOLS: frozenset[str] = (
+    NATIVE_BLOCKED_CREATE_TOOLS | NATIVE_TARGET_GUARDED_TOOLS | NATIVE_ALLOWED_READ_NAV_TOOLS
+)
+_NATIVE_KNOWN_MCP_PREFIXES: tuple[str, ...] = (
+    "mcp__zcode__",
+    "mcp__builtin__",
+    "mcp__plugin_zcode_zcode__",
+)
+
+_SESSION_START_ROUTING_BLOCK = (
+    "<system-reminder>\n"
+    "side-sessions routing rules:\n"
+    "- Use side-sessions MCP tools (`start_session`, `hand_off_to_session`, `send_message_to_session`, "
+    "`cancel_run`, `archive_session`, `list_sessions`, `get_session`) for all managed side sessions.\n"
+    "- Native `CreateSession` / `ForkSession` are blocked in this coordination context, and native "
+    "`SendToSession` / `InterruptSession` / `SetSessionArchived` / `RenameSession` are blocked for "
+    "plugin-managed targets. Never fall back to native session creation/messaging if a side-sessions call "
+    "fails or awaits human approval.\n"
+    "- Native `ListProjects`, `ListSessions`, `ReadSession`, `OpenSession`, and `SetSessionPinned` "
+    "remain available for unmanaged discovery and navigation.\n"
+    "- Human-required waits (`permission`, `AskUserQuestion`, `plan_approval`) and proposals require "
+    "`/side-sessions:respond` or `/side-sessions:approve`.\n"
+    "</system-reminder>"
+)
+
+
+def _normalize_native_tool_name(tool_name: Any) -> str | None:
+    if not isinstance(tool_name, str):
+        return None
+    t = tool_name.strip()
+    if not t:
+        return None
+    if t in NATIVE_SESSION_TOOLS:
+        return t
+    for prefix in _NATIVE_KNOWN_MCP_PREFIXES:
+        if t.startswith(prefix):
+            short = t[len(prefix) :]
+            if short in NATIVE_SESSION_TOOLS:
+                return short
+    return None
+
+
+def _extract_native_target_session_id(tool_input: Any) -> tuple[str | None, str | None]:
+    if isinstance(tool_input, str):
+        s = tool_input.strip()
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, Mapping):
+                    tool_input = parsed
+            except Exception:
+                return None, "Malformed JSON tool_input"
+    if not isinstance(tool_input, Mapping):
+        return None, "Missing or invalid tool_input object for target session resolution"
+
+    candidates: set[str] = set()
+    for top_key in ("sessionId", "session_id"):
+        if top_key in tool_input and tool_input[top_key] is not None:
+            val = tool_input[top_key]
+            if not isinstance(val, str) or not val.strip():
+                return None, f"Invalid {top_key} in tool_input"
+            candidates.add(val.strip())
+
+    if "session" in tool_input and tool_input["session"] is not None:
+        sess_obj = tool_input["session"]
+        if not isinstance(sess_obj, Mapping):
+            return None, "Invalid 'session' field in tool_input"
+        for sub_key in ("sessionId", "session_id"):
+            if sub_key in sess_obj and sess_obj[sub_key] is not None:
+                val = sess_obj[sub_key]
+                if not isinstance(val, str) or not val.strip():
+                    return None, f"Invalid session.{sub_key} in tool_input"
+                candidates.add(val.strip())
+
+    if len(candidates) > 1:
+        return None, f"Conflicting or ambiguous target sessionId values: {sorted(candidates)}"
+    if not candidates:
+        return None, "Missing target sessionId in tool_input"
+    return next(iter(candidates)), None
+
+
+def _extract_elicitation_metadata(wait_row: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    raw_opts = wait_row.get("options")
+    if isinstance(raw_opts, str):
+        try:
+            opts = json.loads(raw_opts or "[]")
+        except Exception:
+            opts = []
+    elif isinstance(raw_opts, list):
+        opts = list(raw_opts)
+    else:
+        opts = []
+
+    questions: list[dict[str, Any]] = []
+    if isinstance(wait_row.get("questions"), list):
+        questions = [dict(q) for q in wait_row["questions"] if isinstance(q, Mapping)]
+
+    plan_options: list[dict[str, Any]] = []
+    requested_schema: dict[str, Any] | None = (
+        dict(wait_row["requestedSchema"]) if isinstance(wait_row.get("requestedSchema"), Mapping) else None
+    )
+    subtype = str(wait_row.get("subtype") or "").strip() or None
+
+    for item in opts:
+        if not isinstance(item, Mapping):
+            continue
+        if not subtype and item.get("subtype"):
+            subtype = str(item["subtype"]).strip()
+        if item.get("kind") == "plan_option" or item.get("subtype") == "plan_approval":
+            plan_options.append(dict(item))
+        elif item.get("kind") == "schema":
+            if requested_schema is None and isinstance(item.get("requestedSchema"), Mapping):
+                requested_schema = dict(item["requestedSchema"])
+            if not questions and isinstance(item.get("questions"), list):
+                questions = [dict(q) for q in item["questions"] if isinstance(q, Mapping)]
+        elif "question" in item and not wait_row.get("questions"):
+            questions.append(dict(item))
+
+    if not subtype:
+        if requested_schema is not None:
+            subtype = "mcp_elicitation"
+        elif plan_options:
+            subtype = "plan_approval"
+        elif questions:
+            subtype = "ask_user_question"
+        else:
+            subtype = "generic"
+
+    return subtype, questions, plan_options, requested_schema
+
+
+def _coerce_mcp_field_value(raw_val: Any, prop_name: str, prop_spec: Mapping[str, Any]) -> str | int | float | bool:
+    if isinstance(raw_val, list):
+        if len(raw_val) == 1:
+            raw_val = raw_val[0]
+        else:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' expects a scalar value",
+                {"field": prop_name},
+            )
+    p_type = str(prop_spec.get("type") or "string").strip().lower()
+    enum_vals = prop_spec.get("enum")
+
+    if enum_vals is not None and isinstance(enum_vals, list):
+        s_val = str(raw_val).strip()
+        allowed_strs = [str(e) for e in enum_vals]
+        if s_val not in allowed_strs:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' value {s_val!r} must be one of {allowed_strs}",
+                {"field": prop_name, "allowed": allowed_strs},
+            )
+        return s_val
+
+    if p_type == "boolean":
+        if type(raw_val) is bool:
+            return "true" if raw_val else "false"
+        if isinstance(raw_val, str):
+            low = raw_val.strip().lower()
+            if low in ("true", "yes"):
+                return "true"
+            if low in ("false", "no"):
+                return "false"
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            f"McpElicitation field '{prop_name}' requires a boolean (true/false/yes/no)",
+            {"field": prop_name, "value": raw_val},
+        )
+
+    if p_type == "integer":
+        if type(raw_val) is bool:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' requires an integer",
+                {"field": prop_name},
+            )
+        if type(raw_val) is int:
+            return str(raw_val)
+        if isinstance(raw_val, str) and re.fullmatch(r"[+-]?\d+", raw_val.strip()):
+            return str(int(raw_val.strip()))
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            f"McpElicitation field '{prop_name}' requires an integer",
+            {"field": prop_name, "value": raw_val},
+        )
+
+    if p_type == "number":
+        if type(raw_val) is bool:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' requires a finite number",
+                {"field": prop_name},
+            )
+        try:
+            num_val = float(raw_val)
+        except (TypeError, ValueError) as exc:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' requires a finite number",
+                {"field": prop_name, "value": raw_val},
+            ) from exc
+        if not math.isfinite(num_val):
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"McpElicitation field '{prop_name}' requires a finite number",
+                {"field": prop_name},
+            )
+        return str(raw_val).strip() if isinstance(raw_val, str) else str(num_val)
+
+    if not isinstance(raw_val, str):
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            f"McpElicitation field '{prop_name}' requires a string",
+            {"field": prop_name},
+        )
+    return raw_val.strip()
+
+
+def _validate_elicitation_payload(wait_row: Mapping[str, Any], resp_obj: Mapping[str, Any]) -> dict[str, Any]:
+    val_resp = _validate_wait_response(resp_obj)
+    action = val_resp["action"]
+    if action in ("decline", "cancel"):
+        return val_resp
+
+    subtype, questions, plan_options, requested_schema = _extract_elicitation_metadata(wait_row)
+    content = val_resp.get("content")
+    if content is None or not isinstance(content, Mapping):
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            "elicitation accept requires a JSON object 'content'",
+        )
+    content_dict = dict(content)
+
+    if subtype == "plan_approval":
+        q_text = plan_options[0].get("question") if plan_options else (questions[0].get("question") if questions else None)
+        answers_map = content_dict.get("answers") if isinstance(content_dict.get("answers"), Mapping) else {}
+        chosen = (
+            (answers_map.get(q_text) if q_text else None)
+            or content_dict.get("answer_0")
+            or content_dict.get("answer")
+        )
+        if not isinstance(chosen, str) or not chosen.strip():
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                "plan_approval accept must carry a valid option value in content (empty {} is rejected)",
+            )
+        chosen_str = chosen.strip()
+        valid_vals = {str(po["value"]).strip() for po in plan_options if po.get("value") is not None}
+        if not valid_vals and questions:
+            for qo in (questions[0].get("options") or []):
+                if isinstance(qo, Mapping) and qo.get("value") is not None:
+                    valid_vals.add(str(qo["value"]).strip())
+        if valid_vals and chosen_str not in valid_vals:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"plan_approval accept value {chosen_str!r} is not in allowed option values {sorted(valid_vals)}",
+                {"allowed_values": sorted(valid_vals)},
+            )
+        return val_resp
+
+    if subtype == "ask_user_question" and questions:
+        answers_map = content_dict.get("answers")
+        if answers_map is not None:
+            if not isinstance(answers_map, Mapping):
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "content.answers must be an object")
+            q_texts = {str(q.get("question") or "") for q in questions}
+            h_texts = {
+                str(q.get("header") or "")
+                for q in questions
+                if q.get("header") and str(q.get("header")) != str(q.get("question") or "")
+            }
+            for k in answers_map:
+                ks = str(k)
+                if ks in h_texts and ks not in q_texts:
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        f"content.answers key {ks!r} uses short header instead of full question text",
+                        {"header": ks},
+                    )
+                if ks not in q_texts:
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        f"content.answers key {ks!r} does not match any full question text",
+                    )
+
+        for idx, q in enumerate(questions):
+            q_txt = str(q.get("question") or "")
+            is_multi = bool(q.get("multiSelect", False))
+            raw_ans = None
+            if isinstance(answers_map, Mapping) and q_txt in answers_map:
+                raw_ans = answers_map[q_txt]
+            elif f"answer_{idx}" in content_dict:
+                raw_ans = content_dict[f"answer_{idx}"]
+            elif len(questions) == 1 and "answer" in content_dict:
+                raw_ans = content_dict["answer"]
+
+            if raw_ans is None:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Missing answer for question[{idx}]: {q_txt!r}",
+                )
+            if isinstance(raw_ans, list):
+                if not is_multi:
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        f"Question[{idx}] is single-select and cannot accept a list answer",
+                    )
+                if not raw_ans or not all(isinstance(x, str) and x.strip() for x in raw_ans):
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        f"Multi-select question[{idx}] requires a non-empty list of strings",
+                    )
+            elif isinstance(raw_ans, str):
+                if not raw_ans.strip():
+                    raise SideSessionError(
+                        ErrorCode.INVALID_REQUEST,
+                        f"Answer for question[{idx}] cannot be empty",
+                    )
+            else:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Invalid answer type for question[{idx}]",
+                )
+        return val_resp
+
+    if subtype == "mcp_elicitation":
+        props = (
+            requested_schema.get("properties")
+            if isinstance(requested_schema, Mapping) and isinstance(requested_schema.get("properties"), Mapping)
+            else {}
+        )
+        req_fields = set(requested_schema.get("required") or []) if isinstance(requested_schema, Mapping) else set()
+        answers_map = content_dict.get("answers")
+        if answers_map is not None:
+            if not isinstance(answers_map, Mapping):
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "content.answers must be an object")
+            if questions:
+                q_texts = {str(q.get("question") or "") for q in questions}
+                h_texts = {
+                    str(q.get("header") or "")
+                    for q in questions
+                    if q.get("header") and str(q.get("header")) != str(q.get("question") or "")
+                }
+                for k in answers_map:
+                    ks = str(k)
+                    if ks in h_texts and ks not in q_texts:
+                        raise SideSessionError(
+                            ErrorCode.INVALID_REQUEST,
+                            f"content.answers key {ks!r} uses short header instead of full question text",
+                        )
+
+        if props:
+            coerced_content = dict(content_dict)
+            coerced_answers = dict(answers_map) if isinstance(answers_map, Mapping) else None
+            for idx, (prop_name, prop_spec) in enumerate(props.items()):
+                if not isinstance(prop_spec, Mapping):
+                    continue
+                q_txt = str(questions[idx].get("question") or prop_name) if idx < len(questions) else prop_name
+                raw_val = None
+                src_loc = None
+                if isinstance(answers_map, Mapping) and q_txt in answers_map:
+                    raw_val = answers_map[q_txt]
+                    src_loc = "answers"
+                elif f"answer_{idx}" in content_dict:
+                    raw_val = content_dict[f"answer_{idx}"]
+                    src_loc = f"answer_{idx}"
+                elif len(props) == 1 and idx == 0 and "answer" in content_dict:
+                    raw_val = content_dict["answer"]
+                    src_loc = "answer"
+                elif prop_name in content_dict:
+                    raw_val = content_dict[prop_name]
+                    src_loc = "prop"
+
+                if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
+                    if prop_name in req_fields:
+                        raise SideSessionError(
+                            ErrorCode.INVALID_REQUEST,
+                            f"Missing required McpElicitation field '{prop_name}'",
+                            {"field": prop_name},
+                        )
+                    continue
+
+                coerced_val = _coerce_mcp_field_value(raw_val, prop_name, prop_spec)
+                if src_loc == "answers" and coerced_answers is not None:
+                    coerced_answers[q_txt] = coerced_val
+                elif src_loc in (f"answer_{idx}", "answer"):
+                    coerced_content[src_loc] = coerced_val
+                elif src_loc == "prop":
+                    coerced_content[f"answer_{idx}"] = coerced_val
+            if coerced_answers is not None:
+                coerced_content["answers"] = coerced_answers
+            val_resp["content"] = coerced_content
+        elif not content_dict:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                "McpElicitation accept requires non-empty content",
+            )
+        return val_resp
+
+    return val_resp
+
+
+def _resolve_permission_option(
+    wait_row: Mapping[str, Any],
+    *,
+    provided_option_id: str | None = None,
+    provided_decision: str | None = None,
+    single_token: str | None = None,
+) -> tuple[str, str]:
+    raw_opts = wait_row.get("options")
+    if isinstance(raw_opts, str):
+        try:
+            opts = json.loads(raw_opts or "[]")
+        except Exception:
+            opts = []
+    elif isinstance(raw_opts, list):
+        opts = list(raw_opts)
+    else:
+        opts = []
+
+    if not opts:
+        if single_token is not None:
+            return single_token, single_token
+        opt_id = provided_option_id or provided_decision or ""
+        dec = provided_decision or provided_option_id or ""
+        if not opt_id or not dec:
+            raise SideSessionError(ErrorCode.INVALID_REQUEST, "Permission response requires option_id and decision")
+        return opt_id, dec
+
+    parsed_opts: list[tuple[str, str, str]] = []
+    for opt in opts:
+        if isinstance(opt, str):
+            parsed_opts.append((opt, opt, opt))
+        elif isinstance(opt, Mapping):
+            o_id = str(opt.get("optionId") or opt.get("option_id") or opt.get("id") or "").strip()
+            o_resp = opt.get("response") if isinstance(opt.get("response"), Mapping) else {}
+            o_dec = str(o_resp.get("decision") or opt.get("decision") or "").strip()
+            o_val = str(opt.get("value") or "").strip()
+            if not o_id and o_val:
+                o_id = o_val
+            if not o_dec and o_val:
+                o_dec = o_val
+            if not o_dec and not o_val and o_id:
+                o_dec = o_id
+            parsed_opts.append((o_id, o_dec, o_val))
+
+    if single_token is not None:
+        id_matches = [item for item in parsed_opts if item[0] == single_token]
+        if len(id_matches) == 1:
+            return id_matches[0][0], id_matches[0][1] or id_matches[0][0]
+        if len(id_matches) > 1:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"Ambiguous permission option_id {single_token!r}",
+            )
+        val_matches = [item for item in parsed_opts if item[1] == single_token or item[2] == single_token]
+        if not val_matches:
+            allowed_ids = [item[0] or item[1] for item in parsed_opts]
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"Permission answer {single_token!r} is not in allowed wait options",
+                {"allowed_options": allowed_ids},
+            )
+        if len(val_matches) > 1:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"Permission decision {single_token!r} matches multiple options; specify exact optionId",
+                {"matching_option_ids": [m[0] for m in val_matches]},
+            )
+        return val_matches[0][0] or val_matches[0][1], val_matches[0][1] or single_token
+
+    if provided_option_id:
+        id_matches = [item for item in parsed_opts if item[0] == provided_option_id or item[2] == provided_option_id]
+        if len(id_matches) == 1:
+            m_id, m_dec, _ = id_matches[0]
+            if provided_decision and m_dec and provided_decision != m_dec:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Permission option_id {provided_option_id!r} conflicts with decision {provided_decision!r} (expected {m_dec!r})",
+                )
+            return m_id, m_dec or provided_decision or m_id
+        if len(id_matches) > 1:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"Ambiguous permission option_id {provided_option_id!r}",
+            )
+        # If option_id didn't match an explicit optionId, only allow if option_id == decision and decision uniquely matches (legacy callers)
+        if provided_decision and provided_option_id == provided_decision:
+            dec_matches = [item for item in parsed_opts if item[1] == provided_decision or item[2] == provided_decision]
+            if len(dec_matches) == 1:
+                return dec_matches[0][0] or dec_matches[0][1], dec_matches[0][1]
+            if len(dec_matches) > 1:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Permission decision {provided_decision!r} matches multiple options; specify exact optionId",
+                    {"matching_option_ids": [m[0] for m in dec_matches]},
+                )
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            f"Permission option_id {provided_option_id!r} is not in allowed wait options",
+            {"allowed_options": [item[0] or item[1] for item in parsed_opts]},
+        )
+
+    if provided_decision:
+        dec_matches = [item for item in parsed_opts if item[1] == provided_decision or item[2] == provided_decision]
+        if len(dec_matches) == 1:
+            return dec_matches[0][0] or dec_matches[0][1], dec_matches[0][1]
+        if len(dec_matches) > 1:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                f"Permission decision {provided_decision!r} matches multiple options; specify exact optionId",
+                {"matching_option_ids": [m[0] for m in dec_matches]},
+            )
+        raise SideSessionError(
+            ErrorCode.INVALID_REQUEST,
+            f"Permission decision {provided_decision!r} is not in allowed wait options",
+        )
+
+    raise SideSessionError(ErrorCode.INVALID_REQUEST, "Permission response requires option_id or decision")
+
+
+def normalize_human_wait_answer(wait_row: Mapping[str, Any], answer_raw: Any) -> dict[str, Any]:
+    """Normalize a human answer (slash text or structured JSON) into a validated WaitResponse dict."""
+    wait_kind = str(wait_row.get("kind") or "input")
+
+    if wait_kind == "input":
+        if isinstance(answer_raw, str):
+            s = answer_raw.strip()
+            if not s:
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Wait answer cannot be empty")
+            if s.startswith("{"):
+                try:
+                    parsed = json.loads(s)
+                except Exception as exc:
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, f"Invalid JSON wait answer: {exc}") from exc
+                if not isinstance(parsed, Mapping) or not isinstance(parsed.get("text"), str):
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, "input wait JSON answer requires string 'text'")
+                return _validate_wait_response({"kind": "input", "text": parsed["text"]})
+            return _validate_wait_response({"kind": "input", "text": s})
+        if isinstance(answer_raw, Mapping):
+            return _validate_wait_response({"kind": "input", "text": answer_raw.get("text")})
+        raise SideSessionError(ErrorCode.INVALID_REQUEST, "Unsupported input wait answer type")
+
+    if wait_kind == "permission":
+        if isinstance(answer_raw, str):
+            s = answer_raw.strip()
+            if not s:
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Permission answer cannot be empty")
+            if s.startswith("{"):
+                try:
+                    parsed = json.loads(s)
+                except Exception as exc:
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, f"Invalid JSON permission answer: {exc}") from exc
+                if not isinstance(parsed, Mapping):
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, "Permission JSON answer must be an object")
+                answer_raw = parsed
+            else:
+                opt_id, dec = _resolve_permission_option(wait_row, single_token=s)
+                return _validate_wait_response({"kind": "permission", "option_id": opt_id, "decision": dec})
+
+        if isinstance(answer_raw, Mapping):
+            if "kind" in answer_raw and answer_raw.get("kind") != "permission":
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Answer kind does not match permission wait")
+            unknown = sorted(set(answer_raw.keys()) - {"kind", "option_id", "optionId", "id", "decision", "value"})
+            if unknown:
+                raise SideSessionError(ErrorCode.UNKNOWN_FIELD, f"Unknown field(s) in permission answer: {unknown}")
+            prov_opt = answer_raw.get("option_id") or answer_raw.get("optionId") or answer_raw.get("id")
+            prov_dec = answer_raw.get("decision") or answer_raw.get("value")
+            opt_id, dec = _resolve_permission_option(
+                wait_row,
+                provided_option_id=str(prov_opt).strip() if prov_opt is not None else None,
+                provided_decision=str(prov_dec).strip() if prov_dec is not None else None,
+            )
+            return _validate_wait_response({"kind": "permission", "option_id": opt_id, "decision": dec})
+
+        raise SideSessionError(ErrorCode.INVALID_REQUEST, "Unsupported permission wait answer type")
+
+    if wait_kind == "elicitation":
+        subtype, questions, plan_options, requested_schema = _extract_elicitation_metadata(wait_row)
+        ans_dict: dict[str, Any] | None = None
+        plain_str: str | None = None
+
+        if isinstance(answer_raw, Mapping):
+            ans_dict = dict(answer_raw)
+        elif isinstance(answer_raw, str):
+            s = answer_raw.strip()
+            if not s:
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Elicitation answer cannot be empty")
+            if s.startswith("{"):
+                try:
+                    parsed = json.loads(s)
+                except Exception as exc:
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, f"Invalid JSON elicitation answer: {exc}") from exc
+                if not isinstance(parsed, Mapping):
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, "Elicitation JSON answer must be an object")
+                ans_dict = dict(parsed)
+            elif s.startswith("["):
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Elicitation answer cannot be a JSON array")
+            else:
+                plain_str = s
+        else:
+            raise SideSessionError(ErrorCode.INVALID_REQUEST, "Unsupported elicitation wait answer type")
+
+        if ans_dict is not None:
+            if "kind" in ans_dict and ans_dict.get("kind") != "elicitation":
+                raise SideSessionError(ErrorCode.INVALID_REQUEST, "Answer kind does not match elicitation wait")
+            cand = dict(ans_dict)
+            cand["kind"] = "elicitation"
+            return _validate_elicitation_payload(wait_row, cand)
+
+        assert plain_str is not None
+        if plain_str in ("decline", "cancel"):
+            return _validate_wait_response({"kind": "elicitation", "action": plain_str})
+        if plain_str == "accept":
+            if subtype in ("plan_approval", "ask_user_question", "mcp_elicitation"):
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Bare 'accept' without content is rejected for {subtype}",
+                )
+            return _validate_wait_response({"kind": "elicitation", "action": "accept", "content": {}})
+
+        if subtype == "plan_approval":
+            if plain_str.lower().startswith("refine:") or plain_str.lower().startswith("refine "):
+                feedback = plain_str.split(":", 1)[1].strip() if ":" in plain_str else plain_str[7:].strip()
+                if not feedback:
+                    raise SideSessionError(ErrorCode.INVALID_REQUEST, "plan_approval refine requires feedback text")
+                return _validate_wait_response({"kind": "elicitation", "action": "decline", "reason": feedback})
+            return _validate_elicitation_payload(
+                wait_row,
+                {"kind": "elicitation", "action": "accept", "content": {"answer": plain_str}},
+            )
+
+        if subtype == "ask_user_question" and len(questions) > 1:
+            raise SideSessionError(
+                ErrorCode.INVALID_REQUEST,
+                "Multi-question AskUserQuestion requires JSON object with answers keyed by full question text or answer_0/answer_1",
+            )
+
+        if subtype == "mcp_elicitation":
+            props = (
+                requested_schema.get("properties")
+                if isinstance(requested_schema, Mapping) and isinstance(requested_schema.get("properties"), Mapping)
+                else {}
+            )
+            req_fields = set(requested_schema.get("required") or []) if isinstance(requested_schema, Mapping) else set()
+            if len(props) > 1 or len(req_fields) > 1:
+                raise SideSessionError(
+                    ErrorCode.INVALID_REQUEST,
+                    "Multi-field McpElicitation requires JSON object with answers/answer_0/answer_1",
+                )
+            return _validate_elicitation_payload(
+                wait_row,
+                {"kind": "elicitation", "action": "accept", "content": {"answer": plain_str}},
+            )
+
+        return _validate_wait_response({"kind": "elicitation", "action": "accept", "content": {"answer": plain_str}})
+
+    raise SideSessionError(ErrorCode.INVALID_REQUEST, f"Unsupported wait kind: {wait_kind!r}")
 
 
 class _AliasStr(str):
@@ -8728,7 +9406,7 @@ class Engine:
                         (candidate_report_id, now, member_id),
                     )
                 existing_wait = txn.execute(
-                    "SELECT wait_id FROM wait_requests WHERE run_id = ? AND state IN ('open', 'responding') LIMIT 1",
+                    "SELECT wait_id FROM wait_requests WHERE run_id = ? AND state IN ('open', 'responding', 'unknown') LIMIT 1",
                     (run_id,),
                 ).fetchone()
                 if existing_wait is None:
@@ -9106,7 +9784,7 @@ class Engine:
                 (exec_state, final_outcome, rcpt.exit_code, rcpt.ended_at or now, eff_run_id),
             )
             txn.execute(
-                "UPDATE wait_requests SET state = 'cancelled', updated_at = ? WHERE run_id = ? AND state IN ('open', 'responding')",
+                "UPDATE wait_requests SET state = 'cancelled', updated_at = ? WHERE run_id = ? AND state IN ('open', 'responding', 'unknown')",
                 (now, eff_run_id),
             )
             txn.execute(
@@ -10098,7 +10776,7 @@ class Engine:
             rows = conn.execute(
                 """
                 SELECT * FROM wait_requests
-                WHERE node_id = ? AND state IN ('open', 'responding')
+                WHERE node_id = ? AND state IN ('open', 'responding', 'unknown')
                 ORDER BY created_at ASC, wait_id ASC
                 """,
                 (node_id,),
@@ -10256,7 +10934,7 @@ class Engine:
                 (target_id,),
             ).fetchone()
             open_wait = txn.execute(
-                "SELECT * FROM wait_requests WHERE node_id = ? AND state IN ('open', 'responding') ORDER BY created_at ASC LIMIT 1",
+                "SELECT * FROM wait_requests WHERE node_id = ? AND state IN ('open', 'responding', 'unknown') ORDER BY created_at ASC LIMIT 1",
                 (target_id,),
             ).fetchone()
             exec_state = str(latest_turn["execution_state"]) if latest_turn is not None else "idle"
@@ -10563,7 +11241,7 @@ class Engine:
         normalize_request("list_waits", norm_args)
 
         conn = self.store.conn
-        state_clause = "" if include_resolved else "AND w.state IN ('open', 'responding')"
+        state_clause = "" if include_resolved else "AND w.state IN ('open', 'responding', 'unknown')"
         if filter_node_id is not None:
             rows = conn.execute(
                 f"""
@@ -10644,7 +11322,7 @@ class Engine:
         if isinstance(raw_resp, Mapping) and "kind" not in raw_resp:
             if "text" in raw_resp and set(raw_resp.keys()) <= {"text"}:
                 raw_args["response"] = {"kind": "input", "text": raw_resp["text"]}
-            elif "action" in raw_resp and set(raw_resp.keys()) <= {"action", "content"}:
+            elif "action" in raw_resp and set(raw_resp.keys()) <= {"action", "content", "reason"}:
                 raw_args["response"] = {"kind": "elicitation", **dict(raw_resp)}
             elif "decision" in raw_resp and set(raw_resp.keys()) <= {"option_id", "decision"}:
                 raw_args["response"] = {
@@ -10684,7 +11362,7 @@ class Engine:
         self._assert_no_active_worktree_job(self.store.conn, target_node_id)
 
         w_state = str(w_row["state"])
-        if w_state in ("responding", "resolved"):
+        if w_state in ("responding", "resolved", "unknown"):
             raise SideSessionError(
                 ErrorCode.WAIT_ALREADY_RESPONDED,
                 f"Wait request {wait_id} has already been responded to",
@@ -10724,29 +11402,25 @@ class Engine:
                 {"wait_id": wait_id, "wait_kind": wait_kind, "response_kind": req["response"]["kind"]},
             )
 
-        response_hash = canonical_json_sha256(req["response"])
-        approval_evidence: ApprovalEvidence | None = None
-
+        validated_wait_resp = dict(req["response"])
         if wait_kind == "permission":
             raw_opts = json.loads(w_row["options"] or "[]") if isinstance(w_row["options"], str) else list(w_row["options"] or [])
             if raw_opts:
-                allowed_tokens: set[str] = set()
-                for opt in raw_opts:
-                    if isinstance(opt, str):
-                        allowed_tokens.add(opt)
-                    elif isinstance(opt, Mapping):
-                        for k_opt in ("option_id", "id", "decision", "value"):
-                            if opt.get(k_opt) is not None:
-                                allowed_tokens.add(str(opt[k_opt]))
-                if allowed_tokens:
-                    opt_id = str(req["response"]["option_id"])
-                    dec_val = str(req["response"]["decision"])
-                    if opt_id not in allowed_tokens and dec_val not in allowed_tokens:
-                        raise SideSessionError(
-                            ErrorCode.INVALID_REQUEST,
-                            "Permission response option_id/decision is not in allowed wait options",
-                            {"wait_id": wait_id, "allowed_options": sorted(allowed_tokens)},
-                        )
+                resolved_opt_id, resolved_dec = _resolve_permission_option(
+                    dict(w_row),
+                    provided_option_id=str(validated_wait_resp["option_id"]),
+                    provided_decision=str(validated_wait_resp["decision"]),
+                )
+                validated_wait_resp = {
+                    "kind": "permission",
+                    "option_id": resolved_opt_id,
+                    "decision": resolved_dec,
+                }
+        elif wait_kind == "elicitation":
+            validated_wait_resp = _validate_elicitation_payload(dict(w_row), validated_wait_resp)
+
+        response_hash = canonical_json_sha256(validated_wait_resp)
+        approval_evidence: ApprovalEvidence | None = None
 
         needs_human = (wait_kind == "permission") or (str(w_row["required_authority"]) == "human")
 
@@ -10759,7 +11433,7 @@ class Engine:
             "wait_id": wait_id,
             "wait_kind": wait_kind,
             "nonce": req["nonce"],
-            "response": req["response"],
+            "response": validated_wait_resp,
             "response_hash": response_hash,
         }
         cmd_payload_json = canonical_json(cmd_payload_obj)
@@ -10900,7 +11574,7 @@ class Engine:
                     "run_id": str(w_row["run_id"]),
                     "parent_node_id": caller_id,
                     "runtime_sid": ctx.runtime_sid,
-                    "response": req["response"],
+                    "response": validated_wait_resp,
                     "response_hash": response_hash,
                     "request_id": req.request_id,
                 }
@@ -11012,7 +11686,7 @@ class Engine:
                     "run_id": run_id,
                     "nonce": req["nonce"],
                     "prompt_nonce": req["nonce"],
-                    "response": req["response"],
+                    "response": validated_wait_resp,
                     "response_hash": response_hash,
                     "state": _AliasStr(next_wait_state, "responding", "queued"),
                     "status": _AliasStr(next_wait_state, "responding", "queued"),
@@ -11686,6 +12360,138 @@ class Engine:
             self._pending_emit_deliveries.clear()
         return updated
 
+    @staticmethod
+    def normalize_human_wait_answer(wait_row: Mapping[str, Any], answer_raw: Any) -> dict[str, Any]:
+        """Normalize a human answer into a validated WaitResponse dict before provenance/hash binding."""
+        return normalize_human_wait_answer(wait_row, answer_raw)
+
+    def _is_managed_target_session(self, conn: Any, target_ref: str) -> tuple[bool, str | None]:
+        """Return (True, node_id) iff `target_ref` resolves to a plugin-managed node (never bare native roots)."""
+        n_row = conn.execute(
+            "SELECT * FROM nodes WHERE runtime_session_id = ? OR node_id = ? LIMIT 1",
+            (target_ref, target_ref),
+        ).fetchone()
+        if n_row is None:
+            b_row = conn.execute(
+                "SELECT node_id FROM bindings WHERE runtime_sid = ? LIMIT 1",
+                (target_ref,),
+            ).fetchone()
+            if b_row is not None:
+                n_row = conn.execute(
+                    "SELECT * FROM nodes WHERE node_id = ? LIMIT 1",
+                    (b_row["node_id"],),
+                ).fetchone()
+        if n_row is None:
+            return False, None
+
+        nid = str(n_row["node_id"])
+        if n_row["parent_node_id"] is not None:
+            return True, nid
+
+        managed_checks = (
+            ("SELECT 1 FROM nodes WHERE parent_node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM turns WHERE node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM tasks WHERE owner_node_id = ? OR origin_node_id = ? LIMIT 1", (nid, nid)),
+            ("SELECT 1 FROM task_turn_bindings WHERE node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM operations WHERE node_id = ? OR actor_node_id = ? LIMIT 1", (nid, nid)),
+            ("SELECT 1 FROM proposals WHERE parent_node_id = ? OR child_node_id = ? LIMIT 1", (nid, nid)),
+            ("SELECT 1 FROM parent_slots WHERE parent_node_id = ? OR node_id = ? LIMIT 1", (nid, nid)),
+            ("SELECT 1 FROM inbox_messages WHERE target_node_id = ? OR source_node_id = ? LIMIT 1", (nid, nid)),
+            ("SELECT 1 FROM worktrees WHERE node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM dispatch_groups WHERE parent_node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM owners WHERE node_id = ? LIMIT 1", (nid,)),
+            ("SELECT 1 FROM wait_requests WHERE node_id = ? LIMIT 1", (nid,)),
+        )
+        for sql, params in managed_checks:
+            if conn.execute(sql, params).fetchone() is not None:
+                return True, nid
+        return False, nid
+
+    def native_session_guard(
+        self,
+        ctx: HookContext | CallerContext | Mapping[str, Any] | str,
+        tool_name: Any,
+        tool_input: Any = None,
+    ) -> dict[str, Any] | None:
+        """Enforce single execution/metadata ownership over ZCode's 12 native Session tools."""
+        norm_tool = _normalize_native_tool_name(tool_name)
+        if norm_tool is None:
+            return None
+
+        if norm_tool in NATIVE_ALLOWED_READ_NAV_TOOLS:
+            return None
+
+        if isinstance(ctx, HookContext):
+            runtime_sid = ctx.runtime_sid
+        elif isinstance(ctx, CallerContext):
+            runtime_sid = ctx.runtime_sid
+        elif isinstance(ctx, Mapping):
+            runtime_sid = str(
+                ctx.get("runtime_sid") or ctx.get("session_id") or ctx.get("sessionId") or ""
+            ).strip()
+        else:
+            runtime_sid = str(ctx or "").strip()
+
+        if norm_tool in NATIVE_BLOCKED_CREATE_TOOLS:
+            # In a side-sessions plugin coordination context (bound node or hook caller),
+            # CreateSession / ForkSession are blocked by default even on initial turn.
+            in_coord_ctx = bool(runtime_sid)
+            if in_coord_ctx:
+                return dict(
+                    validate_hook_output(
+                        "PreToolUse",
+                        {
+                            "continue": False,
+                            "additionalContext": (
+                                f"[{ErrorCode.OWNERSHIP_CONFLICT.value}] Native {norm_tool} is blocked in "
+                                "side-sessions coordination context. Use `start_session` or `hand_off_to_session` "
+                                "instead; never fall back to native session creation."
+                            ),
+                        },
+                    )
+                )
+            return None
+
+        if norm_tool in NATIVE_TARGET_GUARDED_TOOLS:
+            target_sid, err_reason = _extract_native_target_session_id(tool_input)
+            if err_reason is not None or not target_sid:
+                return dict(
+                    validate_hook_output(
+                        "PreToolUse",
+                        {
+                            "continue": False,
+                            "additionalContext": (
+                                f"[{ErrorCode.OWNERSHIP_CONFLICT.value}] Native {norm_tool} blocked: "
+                                f"{err_reason or 'unresolved target sessionId'}."
+                            ),
+                        },
+                    )
+                )
+            managed, target_nid = self._is_managed_target_session(self.store.conn, target_sid)
+            if managed:
+                guidance_map = {
+                    "SendToSession": "Use `send_message_to_session` (FIFO) or `/side-sessions:respond` for waits.",
+                    "InterruptSession": "Use `cancel_run` to stop the managed execution owner.",
+                    "SetSessionArchived": "Use `archive_session` after confirming the managed session is idle.",
+                    "RenameSession": "Blocked on managed nodes to prevent title split with `nodes.title`.",
+                }
+                guidance = guidance_map.get(norm_tool, "Use side-sessions MCP control tools instead.")
+                return dict(
+                    validate_hook_output(
+                        "PreToolUse",
+                        {
+                            "continue": False,
+                            "additionalContext": (
+                                f"[{ErrorCode.OWNERSHIP_CONFLICT.value}] Native {norm_tool} is blocked for "
+                                f"plugin-managed session {target_sid} (node {target_nid}). {guidance}"
+                            ),
+                        },
+                    )
+                )
+            return None
+
+        return None
+
     def handle_hook(
         self,
         ctx: HookContext | Mapping[str, Any],
@@ -12022,49 +12828,8 @@ class Engine:
                             ).fetchone()
                             if w_row is None:
                                 raise SideSessionError(ErrorCode.NOT_FOUND, f"Wait request not found: {wait_id_arg}")
-                            w_kind = str(w_row["kind"])
                             w_nonce = str(w_row["nonce"])
-                            if w_kind == "permission":
-                                opt_id_val = answer_str
-                                dec_val = answer_str
-                                raw_opts = (
-                                    json.loads(w_row["options"] or "[]")
-                                    if isinstance(w_row["options"], str)
-                                    else list(w_row["options"] or [])
-                                )
-                                for opt in raw_opts:
-                                    if isinstance(opt, Mapping):
-                                        cand_ids = {
-                                            str(opt[k])
-                                            for k in ("option_id", "id", "decision", "value")
-                                            if opt.get(k) is not None
-                                        }
-                                        if answer_str in cand_ids:
-                                            opt_id_val = str(
-                                                opt.get("option_id")
-                                                or opt.get("id")
-                                                or opt.get("decision")
-                                                or answer_str
-                                            )
-                                            dec_val = str(
-                                                opt.get("decision")
-                                                or opt.get("value")
-                                                or opt.get("option_id")
-                                                or answer_str
-                                            )
-                                            break
-                                resp_obj: dict[str, Any] = {
-                                    "kind": "permission",
-                                    "option_id": opt_id_val,
-                                    "decision": dec_val,
-                                }
-                            elif w_kind == "elicitation":
-                                if answer_str in ("accept", "decline", "cancel"):
-                                    resp_obj = {"kind": "elicitation", "action": answer_str}
-                                else:
-                                    resp_obj = {"kind": "elicitation", "action": "accept", "content": answer_str}
-                            else:
-                                resp_obj = {"kind": "input", "text": answer_str}
+                            resp_obj = self.normalize_human_wait_answer(dict(w_row), answer_str)
 
                             resp_hash = canonical_json_sha256(resp_obj)
                             target_hash = sha256_hex(f"{w_nonce}:{resp_hash}")
@@ -12275,8 +13040,21 @@ class Engine:
                             (node_id, self._future_iso(minutes=10), turn_marker),
                         )
 
-        # 2. PostToolUse / PreToolUse: bind task action if active/frozen task turn binding exists
+        # 2. PostToolUse / PreToolUse: native ownership guard first, then task_turn_bindings / freeze guard
         if ctx.event in ("PostToolUse", "PreToolUse"):
+            if ctx.event == "PreToolUse":
+                tool_name_pre = str(
+                    raw_in.get("tool_name")
+                    or raw_in.get("toolName")
+                    or raw_in.get("tool")
+                    or ""
+                ).strip()
+                tool_input_pre = raw_in.get("tool_input") if "tool_input" in raw_in else raw_in.get("toolInput")
+                if tool_input_pre is None:
+                    tool_input_pre = raw_in.get("input")
+                guard_out = self.native_session_guard(ctx, tool_name_pre, tool_input_pre)
+                if guard_out is not None:
+                    return guard_out
             turn_key = ctx.runtime_turn_id or "turn-default"
             binding_row = self.store.conn.execute(
                 """
@@ -12448,11 +13226,25 @@ class Engine:
                                 self._pending_emit_deliveries.append((node_id, str(m_row["message_id"])))
 
                 if not eligible and not child_msg_blocks and not command_feedback:
+                    if ctx.event == "SessionStart":
+                        return dict(validate_hook_output("SessionStart", {"additionalContext": _SESSION_START_ROUTING_BLOCK}))
                     return None
 
             parts_out = list(base_parts)
             if child_msg_blocks:
                 parts_out.append("\n".join(child_msg_blocks))
+            if ctx.event == "SessionStart":
+                cand_with_routing = "\n".join(parts_out + [_SESSION_START_ROUTING_BLOCK])
+                if len(cand_with_routing.encode("utf-8")) <= MAX_HOOK_CONTEXT_BYTES:
+                    parts_out.append(_SESSION_START_ROUTING_BLOCK)
+                else:
+                    compact_route = (
+                        "<system-reminder>side-sessions routing: use side-sessions MCP tools; "
+                        "native CreateSession/ForkSession & managed SendToSession/InterruptSession/"
+                        "SetSessionArchived/RenameSession are blocked.</system-reminder>"
+                    )
+                    if len(("\n".join(parts_out + [compact_route])).encode("utf-8")) <= MAX_HOOK_CONTEXT_BYTES:
+                        parts_out.append(compact_route)
             text = "\n".join(parts_out)
             if len(text.encode("utf-8")) > MAX_HOOK_CONTEXT_BYTES:
                 text = text.encode("utf-8")[: MAX_HOOK_CONTEXT_BYTES - 32].decode("utf-8", errors="ignore")

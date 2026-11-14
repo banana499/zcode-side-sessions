@@ -81,7 +81,7 @@ if getattr(Store.__init__, "__name__", "") != "_patched_store_init":
 
 
 SERVER_NAME = "side-sessions"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.3.0"
 DEFAULT_MCP_PROTOCOL_VERSION = "2024-11-05"
 REQUEST_CONTEXT_NAMESPACE = "com.zcode/request-context"
 

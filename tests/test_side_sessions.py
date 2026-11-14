@@ -6249,6 +6249,10 @@ class TestPostPhase2ComprehensiveReviewFixes(IsolatedSideSessionsTestCase):
         const navRoot = new FakeEl('aside', { top: 0, bottom: 720, left: 0, right: 260, width: 260, height: 720 });
         const convSection = new FakeEl('section', { top: 0, bottom: 720, left: 260, right: 1160, width: 900, height: 720 });
         convSection.setAttribute('data-workspace-conversation-frame', 'true');
+        const convWsFiber = { tag: 0, memoizedProps: { workspaceMainView: 'chat', isWorkspaceVisible: true }, return: null };
+        const convSecProps = { 'data-workspace-conversation-frame': 'true' };
+        convSection['__reactFiber$test'] = { tag: 5, stateNode: convSection, memoizedProps: convSecProps, return: convWsFiber };
+        convSection['__reactProps$test'] = convSecProps;
         const convHeader = new FakeEl('header', { top: 0, bottom: 48, left: 260, right: 1160, width: 900, height: 48 });
         convSection.append(convHeader);
         bodyEl.append(navRoot, convSection);
